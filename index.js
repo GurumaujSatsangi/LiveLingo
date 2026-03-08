@@ -16,6 +16,7 @@ app.use(express.urlencoded({ extended: true }));
 app.set("view engine", "ejs");
 
 const SEGMENT_FOLDER = "./audio_chunks";
+const TRANSLATED_AUDIO_FOLDER = "./translated_audio";
 const MAX_RESTART_RETRIES = 5;
 const CHUNK_SCAN_INTERVAL_MS = 2000;
 const MAX_CHUNK_RETRIES = 2;
@@ -34,9 +35,12 @@ const transcriptResults = [];
 let isChunkWorkerRunning = false;
 let chunkScannerTimer;
 
-// create folder if not exists
+// create folders if not exist
 if (!fs.existsSync(SEGMENT_FOLDER)) {
   fs.mkdirSync(SEGMENT_FOLDER);
+}
+if (!fs.existsSync(TRANSLATED_AUDIO_FOLDER)) {
+  fs.mkdirSync(TRANSLATED_AUDIO_FOLDER);
 }
 
 let ffmpeg;
@@ -78,6 +82,41 @@ function extractTranscriptText(response) {
     });
 
     return normalizeText(translationResponse?.translated_text);
+  }
+
+  async function convertTextToSpeech(text, chunkName) {
+    if (!text || !sarvamClient) return null;
+
+    try {
+      const ttsResponse = await sarvamClient.textToSpeech.convert({
+        text: text,
+        target_language_code: "en-IN",
+        speaker: "anushka",
+        pitch: 0,
+        pace: 1.0,
+        loudness: 1.5,
+        speech_sample_rate: 16000,
+        enable_preprocessing: true,
+        model: "bulbul:v2",
+      });
+
+      if (ttsResponse && ttsResponse.audios && ttsResponse.audios.length > 0) {
+        const audioBase64 = ttsResponse.audios[0];
+        const audioBuffer = Buffer.from(audioBase64, "base64");
+        
+        // Generate output filename based on original chunk name
+        const baseName = path.basename(chunkName, path.extname(chunkName));
+        const outputPath = path.join(TRANSLATED_AUDIO_FOLDER, `${baseName}_translated.wav`);
+        
+        fs.writeFileSync(outputPath, audioBuffer);
+        console.log(`🔊 TTS audio saved: ${outputPath}`);
+        return outputPath;
+      }
+      return null;
+    } catch (err) {
+      console.error(`❌ TTS conversion failed for ${chunkName}: ${err.message}`);
+      return null;
+    }
   }
 function enqueueChunkForTranscription(filePath) {
   if (processedChunks.has(filePath) || queuedChunks.has(filePath)) {
@@ -146,6 +185,9 @@ async function processChunkQueue() {
         const englishText = translatedText || "[empty response]";
       const chunkName = path.basename(chunkPath);
 
+      // Convert translated English text to speech
+      const audioPath = await convertTextToSpeech(englishText, chunkName);
+
       transcriptResults.push({
         chunk: chunkName,
           sourceLanguageCode,
@@ -153,6 +195,7 @@ async function processChunkQueue() {
           englishText,
           text: englishText,
           sttResponse,
+        translatedAudioPath: audioPath,
         at: new Date().toISOString(),
       });
       if (transcriptResults.length > 100) {
