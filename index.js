@@ -61,6 +61,24 @@ function extractTranscriptText(response) {
   );
 }
 
+  async function translateTextToEnglish(inputText, sourceLanguageCode) {
+    if (!inputText) return "";
+
+    const normalizedSourceLanguage = /^[a-z]{2,3}-IN$/i.test(
+      sourceLanguageCode || ""
+    )
+      ? sourceLanguageCode
+      : "auto";
+
+    const translationResponse = await sarvamClient.text.translate({
+      input: inputText,
+      source_language_code: normalizedSourceLanguage,
+      target_language_code: "en-IN",
+      model: "sarvam-translate:v1",
+    });
+
+    return normalizeText(translationResponse?.translated_text);
+  }
 function enqueueChunkForTranscription(filePath) {
   if (processedChunks.has(filePath) || queuedChunks.has(filePath)) {
     return;
@@ -116,17 +134,25 @@ async function processChunkQueue() {
     }
 
     try {
-      const response = await sarvamClient.speechToText.translate({
+        const sttResponse = await sarvamClient.speechToText.transcribe({
         file: fs.createReadStream(chunkPath),
+          language_code: "unknown",
       });
 
-      const translatedText = extractTranscriptText(response) || "[empty response]";
+        const sourceText = extractTranscriptText(sttResponse);
+        const sourceLanguageCode = sttResponse?.language_code || "auto";
+        const translatedText = await translateTextToEnglish(sourceText, sourceLanguageCode);
+
+        const englishText = translatedText || "[empty response]";
       const chunkName = path.basename(chunkPath);
 
       transcriptResults.push({
         chunk: chunkName,
-        text: translatedText,
-        response,
+          sourceLanguageCode,
+          sourceText,
+          englishText,
+          text: englishText,
+          sttResponse,
         at: new Date().toISOString(),
       });
       if (transcriptResults.length > 100) {
@@ -135,7 +161,9 @@ async function processChunkQueue() {
 
       processedChunks.add(chunkPath);
       failedChunkRetries.delete(chunkPath);
-      console.log(`📝 Sarvam (${chunkName}): ${translatedText}`);
+        console.log(
+          `📝 Sarvam (${chunkName}) [${sourceLanguageCode}] -> EN: ${englishText}`
+        );
     } catch (err) {
       const retries = (failedChunkRetries.get(chunkPath) || 0) + 1;
       failedChunkRetries.set(chunkPath, retries);
@@ -160,6 +188,10 @@ async function processChunkQueue() {
 function startChunkScanner() {
   if (!sarvamClient) {
     console.warn("⚠️  SARVAM_API_KEY not set. Chunk transcription is disabled.");
+    return;
+  }
+
+  if (chunkScannerTimer) {
     return;
   }
 
