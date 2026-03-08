@@ -3,18 +3,29 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Document</title>
+    <title>Live Dashboard | LiveLingo</title>
   </head>
   <body>
     <center>
-        <h1>LiveLingo Livestream</h1><hr>
+      <h1>LiveLingo Livestream</h1>
+      <hr />
 
-      <iframe
-        width="800px"
-        height="500px"
-        src="https://player.cloudinary.com/embed/?cloud_name=ddcep8pbc&public_id=live_stream_bcbcc2fb66d34fec918f93a44bb607e6_hls&profile=cld-live-streaming"
-      >
-      </iframe>
+      <% if (streamURL) { %>
+      <video width="800" height="500" controls autoplay muted playsinline>
+        <source src="<%= streamURL %>" type="application/x-mpegURL" />
+        Your browser does not support HLS playback.
+      </video>
+      <% } else { %>
+      <p>No live stream configured.</p>
+      <p>
+        Set <code>AWS_IVS_PLAYBACK_URL</code> in <code>.env</code> or enable
+        <code>TEST_MODE=true</code>.
+      </p>
+      <% } %>
+
+      <% if (testMode) { %>
+      <p><strong>Test mode is enabled.</strong></p>
+      <% } %>
     </center>
   </body>
 </html>
