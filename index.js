@@ -5,6 +5,7 @@ import ffmpegPath from "ffmpeg-static";
 import fs from "fs";
 import path from "path";
 import { SarvamAIClient } from "sarvamai";
+import IVSTranslatorStreamer from "./ivsTranslatorStreamer.js";
 
 dotenv.config();
 
@@ -26,6 +27,9 @@ let lastRestartTime = 0;
 const sarvamClient = process.env.SARVAM_API_KEY
   ? new SarvamAIClient({ apiSubscriptionKey: process.env.SARVAM_API_KEY })
   : null;
+
+// Initialize IVS Translator Streamer
+const ivsStreamer = new IVSTranslatorStreamer();
 
 const chunkQueue = [];
 const queuedChunks = new Set();
@@ -85,7 +89,7 @@ function extractTranscriptText(response) {
   }
 
   async function convertTextToSpeech(text, chunkName) {
-    if (!text || !sarvamClient) return null;
+    if (!text || !sarvamClient) return { audioPath: null, audioBuffer: null };
 
     try {
       const ttsResponse = await sarvamClient.textToSpeech.convert({
@@ -110,12 +114,12 @@ function extractTranscriptText(response) {
         
         fs.writeFileSync(outputPath, audioBuffer);
         console.log(`🔊 TTS audio saved: ${outputPath}`);
-        return outputPath;
+        return { audioPath: outputPath, audioBuffer: audioBuffer };
       }
-      return null;
+      return { audioPath: null, audioBuffer: null };
     } catch (err) {
       console.error(`❌ TTS conversion failed for ${chunkName}: ${err.message}`);
-      return null;
+      return { audioPath: null, audioBuffer: null };
     }
   }
 function enqueueChunkForTranscription(filePath) {
@@ -186,7 +190,13 @@ async function processChunkQueue() {
       const chunkName = path.basename(chunkPath);
 
       // Convert translated English text to speech
-      const audioPath = await convertTextToSpeech(englishText, chunkName);
+      const ttsResult = await convertTextToSpeech(englishText, chunkName);
+      const { audioPath, audioBuffer } = ttsResult;
+
+      // Send translated audio to IVS stream
+      if (audioBuffer && ivsStreamer.isRunning) {
+        await ivsStreamer.sendTranslatedAudioChunk(audioBuffer);
+      }
 
       transcriptResults.push({
         chunk: chunkName,
@@ -554,6 +564,27 @@ app.get("/transcripts", (req, res) => {
   });
 });
 
+// Get IVS stream status
+app.get("/ivs/status", (req, res) => {
+  res.json(ivsStreamer.getStatus());
+});
+
+// Start IVS stream manually
+app.post("/ivs/start", async (req, res) => {
+  const success = await ivsStreamer.startStream();
+  if (success) {
+    res.json({ message: "IVS stream started", status: ivsStreamer.getStatus() });
+  } else {
+    res.status(400).json({ error: "Failed to start IVS stream" });
+  }
+});
+
+// Stop IVS stream manually
+app.post("/ivs/stop", async (req, res) => {
+  await ivsStreamer.stopStream();
+  res.json({ message: "IVS stream stopped" });
+});
+
 // Start stream manually
 app.post("/stream/start", (req, res) => {
   const streamURL = getStreamURL();
@@ -593,7 +624,7 @@ if (!getStreamURL() && process.env.TEST_MODE !== "true") {
 
 // Start server
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(
     `\n🚀 Server running on http://localhost:${PORT}`
   );
@@ -615,10 +646,19 @@ app.listen(PORT, () => {
     console.log(" To start: Set AWS_IVS_PLAYBACK_URL or TEST_MODE=true in .env");
     startChunkScanner();
   }
+
+  // Start IVS translator stream if configured
+  if (process.env.AWS_IVS_INGEST_URL && process.env.AWS_IVS_STREAM_KEY) {
+    console.log("🎥 Starting IVS translator stream...");
+    await ivsStreamer.startStream();
+  } else {
+    console.log("⏸️  AWS IVS translator stream not configured.");
+    console.log(" To enable: Set AWS_IVS_INGEST_URL and AWS_IVS_STREAM_KEY in .env");
+  }
 });
 
 // Graceful shutdown
-process.on("SIGINT", () => {
+process.on("SIGINT", async () => {
   console.log("\n🛑 Shutting down gracefully...");
   if (chunkScannerTimer) {
     clearInterval(chunkScannerTimer);
@@ -626,5 +666,7 @@ process.on("SIGINT", () => {
   if (ffmpeg && !ffmpeg.killed) {
     ffmpeg.kill("SIGTERM");
   }
+  // Stop IVS stream
+  await ivsStreamer.stopStream();
   process.exit(0);
 });
