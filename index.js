@@ -5,9 +5,11 @@ import ffmpegPath from "ffmpeg-static";
 import fs from "fs";
 import path from "path";
 import { SarvamAIClient } from "sarvamai";
-import { WaveFile } from "wavefile";
+import wavefilePkg from "wavefile";
 import IVSTranslatorStreamer from "./ivsTranslatorStreamer.js";
 import StreamSessionManager from "./StreamSessionManager.js";
+
+const { WaveFile } = wavefilePkg;
 
 dotenv.config();
 
@@ -28,6 +30,7 @@ const HOLD_AUDIO_PUSH_INTERVAL_MS = 4000;
 const TARGET_CHUNK_DURATION_SEC = 60;
 const MIN_ACCEPTABLE_CHUNK_DURATION_SEC = 58;
 const SHORT_CHUNK_SKIP_AGE_MS = 90 * 1000;
+const SARVAM_MAX_SEGMENT_SEC = 29;
 let restartAttempts = 0;
 let lastRestartTime = 0;
 
@@ -110,6 +113,102 @@ function ffmpegCollectOutput(args) {
       reject(new Error(`FFmpeg exited with code ${code}: ${stderr.trim()}`));
     });
   });
+}
+
+function ffmpegRun(args) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(ffmpegPath, args, {
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+
+    let stderr = "";
+    proc.stderr.on("data", (data) => {
+      stderr += data.toString();
+    });
+
+    proc.on("error", reject);
+    proc.on("close", (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+
+      reject(new Error(`FFmpeg exited with code ${code}: ${stderr.trim()}`));
+    });
+  });
+}
+
+async function splitChunkForSarvam(chunkPath) {
+  const baseName = path.basename(chunkPath, path.extname(chunkPath));
+  const splitPattern = path.join(SEGMENT_FOLDER, `${baseName}_sarvam_%03d.wav`);
+
+  await ffmpegRun([
+    "-i",
+    chunkPath,
+    "-f",
+    "segment",
+    "-segment_time",
+    String(SARVAM_MAX_SEGMENT_SEC),
+    "-c:a",
+    "pcm_s16le",
+    "-ar",
+    "16000",
+    "-ac",
+    "1",
+    splitPattern,
+  ]);
+
+  return fs
+    .readdirSync(SEGMENT_FOLDER)
+    .filter((file) => file.startsWith(`${baseName}_sarvam_`) && file.endsWith(".wav"))
+    .sort()
+    .map((file) => path.join(SEGMENT_FOLDER, file));
+}
+
+async function transcribeOneMinuteChunkWithSarvam(chunkPath) {
+  const partFiles = await splitChunkForSarvam(chunkPath);
+  if (partFiles.length === 0) {
+    throw new Error(`No split parts generated for ${path.basename(chunkPath)}`);
+  }
+
+  const transcriptParts = [];
+  let detectedLanguageCode = "auto";
+  let lastResponse = null;
+
+  try {
+    for (const partPath of partFiles) {
+      const sttResponse = await sarvamClient.speechToText.transcribe({
+        file: fs.createReadStream(partPath),
+        language_code: detectedLanguageCode === "auto" ? "unknown" : detectedLanguageCode,
+      });
+
+      lastResponse = sttResponse;
+      const partText = extractTranscriptText(sttResponse).trim();
+      if (partText) {
+        transcriptParts.push(partText);
+      }
+
+      const responseLanguage = sttResponse?.language_code;
+      if (typeof responseLanguage === "string" && /^[a-z]{2,3}-IN$/i.test(responseLanguage)) {
+        detectedLanguageCode = responseLanguage;
+      }
+    }
+  } finally {
+    for (const partPath of partFiles) {
+      try {
+        fs.unlinkSync(partPath);
+      } catch {
+        // Ignore cleanup errors for temp files.
+      }
+    }
+  }
+
+  return {
+    sourceText: transcriptParts.join(" ").trim(),
+    sourceLanguageCode: detectedLanguageCode,
+    sttResponse: lastResponse,
+    partCount: partFiles.length,
+  };
 }
 
 async function loadHoldAudioBuffer() {
@@ -377,7 +476,7 @@ function scanForNewChunks() {
   try {
     const files = fs
       .readdirSync(SEGMENT_FOLDER)
-      .filter((file) => file.endsWith(".wav"))
+      .filter((file) => file.endsWith(".wav") && !file.includes("_sarvam_"))
       .sort();
 
     for (const file of files) {
@@ -430,19 +529,19 @@ async function processChunkQueue() {
     try {
       isSarvamProcessingChunk = true;
 
-      // Step 1: Transcribe with language detection
-      const sttResponse = await sarvamClient.speechToText.transcribe({
-        file: fs.createReadStream(chunkPath),
-        language_code: "unknown",
-      });
+      // Step 1: Transcribe 1-minute chunk via <=30s Sarvam STT parts.
+      const transcriptionResult = await transcribeOneMinuteChunkWithSarvam(chunkPath);
+      const sourceText = transcriptionResult.sourceText;
+      const sourceLanguageCode = transcriptionResult.sourceLanguageCode || "auto";
+      const sttResponse = transcriptionResult.sttResponse;
 
-      const sourceText = extractTranscriptText(sttResponse);
-      const sourceLanguageCode = sttResponse?.language_code || "auto";
-      
       // Update session with detected language
       sessionManager.setSourceLanguage(sessionId, sourceLanguageCode);
 
       const chunkName = path.basename(chunkPath);
+      console.log(
+        `🧩 Chunk ${chunkName} split into ${transcriptionResult.partCount} STT part(s) for Sarvam limit`
+      );
 
       if (!sourceText || sourceText === "[empty response]") {
         console.log(`⏭️  Skipping empty transcription for ${chunkName}`);
