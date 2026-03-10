@@ -25,10 +25,19 @@ class IVSTranslatorStreamer {
     this.ffmpeg = null;
     this.isRunning = false;
     this.reconnectAttempts = 0;
-    this.audioQueue = [];
-    this.isProcessingQueue = false;
     this.isHandlingError = false;
-    this.stdinBuffer = Buffer.alloc(0);
+    this.pendingChunks = new Map(); // Map of seq -> PCM audio buffer
+    this.nextSequenceToPlay = 1;
+    this.autoSequenceCounter = 1;
+    this.playbackTimer = null;
+    this.currentChunk = null; // { seq, buffer, offset }
+    this.frameDurationMs = 20;
+    this.frameBytes = 640; // 20ms @ 16kHz mono s16le => 16000 * 2 * 0.02
+    this.waitingForDrain = false;
+    this.fallbackPcmBuffer = null;
+    this.fallbackOffset = 0;
+    this.missingSequenceSince = null;
+    this.maxMissingSequenceWaitMs = options.maxMissingSequenceWaitMs || 800;
 
     console.log(`🎯 IVS Translator Streamer initialized for: ${this.language.toUpperCase()}`);
   }
@@ -174,6 +183,7 @@ class IVSTranslatorStreamer {
 
       this.isRunning = true;
       this.reconnectAttempts = 0;
+      this.startPlaybackLoop();
       console.log(`✅ IVS ${this.language.toUpperCase()} translator stream started for session ${session}: ${streamUrl}`);
       return true;
     } catch (err) {
@@ -200,6 +210,7 @@ class IVSTranslatorStreamer {
     }
 
     this.isRunning = false;
+    this.stopPlaybackLoop();
 
     if (this.reconnectAttempts < this.maxReconnectAttempts) {
       this.reconnectAttempts++;
@@ -220,9 +231,151 @@ class IVSTranslatorStreamer {
   }
 
   /**
-   * Queue an audio chunk for sending
+   * Set fallback PCM audio for gapless playout when translated chunks are not ready.
    */
-  enqueueAudioChunk(buffer) {
+  setFallbackAudio(pcmBuffer) {
+    if (!pcmBuffer || !Buffer.isBuffer(pcmBuffer) || pcmBuffer.length === 0) {
+      this.fallbackPcmBuffer = null;
+      this.fallbackOffset = 0;
+      return;
+    }
+
+    this.fallbackPcmBuffer = pcmBuffer;
+    this.fallbackOffset = 0;
+  }
+
+  startPlaybackLoop() {
+    if (this.playbackTimer) {
+      return;
+    }
+
+    this.playbackTimer = setInterval(() => {
+      this.playbackTick();
+    }, this.frameDurationMs);
+  }
+
+  stopPlaybackLoop() {
+    if (this.playbackTimer) {
+      clearInterval(this.playbackTimer);
+      this.playbackTimer = null;
+    }
+    this.currentChunk = null;
+    this.waitingForDrain = false;
+    this.missingSequenceSince = null;
+  }
+
+  playbackTick() {
+    if (!this.isRunning || !this.ffmpeg || this.waitingForDrain) {
+      return;
+    }
+
+    if (!this.ffmpeg.stdin || this.ffmpeg.stdin.destroyed || !this.ffmpeg.stdin.writable) {
+      return;
+    }
+
+    const frame = this.getNextFrame();
+    const writeSuccess = this.ffmpeg.stdin.write(frame);
+
+    if (!writeSuccess) {
+      this.waitingForDrain = true;
+      this.ffmpeg.stdin.once("drain", () => {
+        this.waitingForDrain = false;
+      });
+    }
+  }
+
+  getNextFrame() {
+    // Load next in-order chunk when available.
+    if (!this.currentChunk) {
+      const nextBuffer = this.pendingChunks.get(this.nextSequenceToPlay);
+      if (nextBuffer) {
+        this.pendingChunks.delete(this.nextSequenceToPlay);
+        this.currentChunk = {
+          seq: this.nextSequenceToPlay,
+          buffer: nextBuffer,
+          offset: 0,
+        };
+        this.missingSequenceSince = null;
+      } else {
+        this.handlePotentialMissingSequence();
+      }
+    }
+
+    if (!this.currentChunk) {
+      return this.getFallbackFrame();
+    }
+
+    const chunk = this.currentChunk;
+    const remaining = chunk.buffer.length - chunk.offset;
+
+    if (remaining <= this.frameBytes) {
+      const tail = chunk.buffer.slice(chunk.offset);
+      this.currentChunk = null;
+      this.nextSequenceToPlay += 1;
+
+      if (tail.length === this.frameBytes) {
+        return tail;
+      }
+
+      const filler = this.getFallbackFrame();
+      return Buffer.concat([tail, filler.slice(0, this.frameBytes - tail.length)]);
+    }
+
+    const frame = chunk.buffer.slice(chunk.offset, chunk.offset + this.frameBytes);
+    chunk.offset += this.frameBytes;
+    return frame;
+  }
+
+  handlePotentialMissingSequence() {
+    const hasFutureChunk = Array.from(this.pendingChunks.keys()).some(
+      (seq) => seq > this.nextSequenceToPlay
+    );
+
+    if (!hasFutureChunk) {
+      this.missingSequenceSince = null;
+      return;
+    }
+
+    if (!this.missingSequenceSince) {
+      this.missingSequenceSince = Date.now();
+      return;
+    }
+
+    if (Date.now() - this.missingSequenceSince > this.maxMissingSequenceWaitMs) {
+      console.warn(
+        `⏭️  Skipping missing ${this.language.toUpperCase()} sequence ${this.nextSequenceToPlay} after wait timeout`
+      );
+      this.nextSequenceToPlay += 1;
+      this.missingSequenceSince = null;
+    }
+  }
+
+  getFallbackFrame() {
+    if (!this.fallbackPcmBuffer || this.fallbackPcmBuffer.length === 0) {
+      return Buffer.alloc(this.frameBytes);
+    }
+
+    const source = this.fallbackPcmBuffer;
+    const frame = Buffer.alloc(this.frameBytes);
+    let copied = 0;
+
+    while (copied < this.frameBytes) {
+      const remainingFrame = this.frameBytes - copied;
+      const remainingSource = source.length - this.fallbackOffset;
+      const bytesToCopy = Math.min(remainingFrame, remainingSource);
+
+      source.copy(frame, copied, this.fallbackOffset, this.fallbackOffset + bytesToCopy);
+      copied += bytesToCopy;
+      this.fallbackOffset = (this.fallbackOffset + bytesToCopy) % source.length;
+    }
+
+    return frame;
+  }
+
+  /**
+   * Queue a translated PCM audio chunk by sequence number.
+   */
+  enqueueAudioChunk(buffer, options = {}) {
     if (!this.isRunning) {
       console.warn("⚠️  IVS stream not running, queuing audio chunk");
     }
@@ -232,65 +385,35 @@ class IVSTranslatorStreamer {
       return false;
     }
 
-    this.audioQueue.push(buffer);
-    this.processAudioQueue();
+    const sequenceNumber =
+      Number.isInteger(options.seq) && options.seq > 0
+        ? options.seq
+        : this.autoSequenceCounter++;
+
+    if (sequenceNumber < this.nextSequenceToPlay) {
+      console.warn(
+        `⚠️  Dropping late ${this.language.toUpperCase()} sequence ${sequenceNumber}; next expected is ${this.nextSequenceToPlay}`
+      );
+      return false;
+    }
+
+    if (this.pendingChunks.has(sequenceNumber)) {
+      console.warn(
+        `⚠️  Duplicate ${this.language.toUpperCase()} sequence ${sequenceNumber} ignored`
+      );
+      return false;
+    }
+
+    this.pendingChunks.set(sequenceNumber, buffer);
     return true;
-  }
-
-  /**
-   * Process queued audio chunks sequentially
-   */
-  async processAudioQueue() {
-    if (this.isProcessingQueue || this.audioQueue.length === 0) {
-      return;
-    }
-
-    this.isProcessingQueue = true;
-
-    while (this.audioQueue.length > 0) {
-      const audioBuffer = this.audioQueue.shift();
-
-      if (!this.isRunning || !this.ffmpeg) {
-        console.warn(`⚠️  ${this.language.toUpperCase()} stream not running, skipping audio chunk`);
-        this.isProcessingQueue = false;
-        return;
-      }
-
-      if (!this.ffmpeg.stdin || this.ffmpeg.stdin.destroyed || !this.ffmpeg.stdin.writable) {
-        console.warn(`⚠️  ${this.language.toUpperCase()} stdin not writable, skipping audio chunk`);
-        this.isProcessingQueue = false;
-        return;
-      }
-
-      try {
-        // Write audio buffer to FFmpeg stdin
-        const writeSuccess = this.ffmpeg.stdin.write(audioBuffer);
-
-        if (!writeSuccess) {
-          // Backpressure: wait for drain event
-          await new Promise((resolve) => {
-            this.ffmpeg.stdin.once("drain", resolve);
-          });
-        }
-
-        console.log(`🔊 Sent ${this.language.toUpperCase()} translated audio chunk (${audioBuffer.length} bytes)`);
-      } catch (err) {
-        console.error(`❌ Error writing audio to FFmpeg [${this.language}]: ${err.message}`);
-        this.handleStreamError();
-        this.isProcessingQueue = false;
-        return;
-      }
-    }
-
-    this.isProcessingQueue = false;
   }
 
   /**
    * Send translated audio chunk to the stream
    * Public API function
    */
-  async sendTranslatedAudioChunk(buffer) {
-    return this.enqueueAudioChunk(buffer);
+  async sendTranslatedAudioChunk(buffer, options = {}) {
+    return this.enqueueAudioChunk(buffer, options);
   }
 
   /**
@@ -300,6 +423,9 @@ class IVSTranslatorStreamer {
     console.log(`🛑 Stopping IVS ${this.language.toUpperCase()} translator stream...`);
 
     this.isRunning = false;
+    this.stopPlaybackLoop();
+    this.pendingChunks.clear();
+    this.currentChunk = null;
 
     if (this.ffmpeg && !this.ffmpeg.killed) {
       try {
@@ -343,7 +469,8 @@ class IVSTranslatorStreamer {
     return {
       language: this.language,
       isRunning: this.isRunning,
-      queueLength: this.audioQueue.length,
+      queueLength: this.pendingChunks.size,
+      nextSequenceToPlay: this.nextSequenceToPlay,
       reconnectAttempts: this.reconnectAttempts,
       maxReconnectAttempts: this.maxReconnectAttempts,
       streamUrl: this.getStreamUrl(),
