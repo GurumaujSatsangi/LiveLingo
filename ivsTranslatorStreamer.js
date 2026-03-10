@@ -4,11 +4,21 @@ import ffmpegPath from "ffmpeg-static";
 /**
  * AWS IVS Translator Streamer
  * Streams translated audio chunks to AWS IVS RTMP endpoint with dummy video
+ * Supports language-specific streaming with session management
  */
 class IVSTranslatorStreamer {
   constructor(options = {}) {
-    this.rtmpUrl = options.rtmpUrl || process.env.AWS_IVS_INGEST_URL;
-    this.streamKey = options.streamKey || process.env.AWS_IVS_STREAM_KEY;
+    // Language identifier (e.g., 'hindi', 'bangla', 'tamil')
+    this.language = options.language || 'english';
+    
+    // RTMP configuration - can be language-specific
+    this.rtmpUrl = options.rtmpUrl || process.env[`AWS_IVS_INGEST_URL_${this.language.toUpperCase()}`] || process.env.AWS_IVS_INGEST_URL;
+    this.streamKey = options.streamKey || process.env[`AWS_IVS_STREAM_KEY_${this.language.toUpperCase()}`] || process.env.AWS_IVS_STREAM_KEY;
+    
+    // Session management
+    this.currentSessionId = null;
+    this.sessionStreams = new Map(); // Map of sessionId -> FFmpeg process
+
     this.maxReconnectAttempts = options.maxReconnectAttempts || 5;
     this.reconnectDelay = options.reconnectDelay || 3000;
 
@@ -17,7 +27,10 @@ class IVSTranslatorStreamer {
     this.reconnectAttempts = 0;
     this.audioQueue = [];
     this.isProcessingQueue = false;
+    this.isHandlingError = false;
     this.stdinBuffer = Buffer.alloc(0);
+
+    console.log(`🎯 IVS Translator Streamer initialized for: ${this.language.toUpperCase()}`);
   }
 
   /**
@@ -26,22 +39,27 @@ class IVSTranslatorStreamer {
   getStreamUrl() {
     if (!this.rtmpUrl || !this.streamKey) {
       console.error(
-        "❌ AWS IVS configuration missing. Set AWS_IVS_INGEST_URL and AWS_IVS_STREAM_KEY"
+        `❌ AWS IVS configuration missing for ${this.language}. Set AWS_IVS_INGEST_URL_${this.language.toUpperCase()} and AWS_IVS_STREAM_KEY_${this.language.toUpperCase()}`
       );
       return null;
     }
 
     // Construct RTMPS URL with stream key
     const baseUrl = this.rtmpUrl.replace(/^rtmp:\/\//, "rtmps://");
-    return `${baseUrl}/${this.streamKey}`;
+    return `${baseUrl}${this.streamKey}`;
   }
 
   /**
-   * Start FFmpeg process with dummy video and audio from stdin
+   * Start FFmpeg process for a specific session
+   * Reuses existing FFmpeg process if already running for this session
    */
-  async startStream() {
-    if (this.isRunning) {
-      console.log("⏳ IVS streamer already running");
+  async startStream(sessionId = null) {
+    const session = sessionId || `session_${Date.now()}`;
+    this.currentSessionId = session;
+
+    // If stream already running for this session, reuse it
+    if (this.isRunning && this.ffmpeg && !this.ffmpeg.killed) {
+      console.log(`⏳ IVS ${this.language.toUpperCase()} streamer already running for session ${session}`);
       return true;
     }
 
@@ -50,7 +68,7 @@ class IVSTranslatorStreamer {
       return false;
     }
 
-    console.log("🚀 Starting IVS translator stream...");
+    console.log(`🚀 Starting IVS ${this.language.toUpperCase()} translator stream for session ${session}...`);
 
     // FFmpeg command to stream dummy video + audio to AWS IVS
     const ffmpegArgs = [
@@ -67,6 +85,8 @@ class IVSTranslatorStreamer {
       "16000",
       "-ac",
       "1",
+      "-thread_queue_size",
+      "1024",
       "-i",
       "pipe:0",
 
@@ -106,9 +126,6 @@ class IVSTranslatorStreamer {
       // Network timeout
       "-rtmp_live",
       "live",
-      "-application",
-      "rtmp",
-
       // Output URL
       streamUrl,
     ];
@@ -118,14 +135,20 @@ class IVSTranslatorStreamer {
         stdio: ["pipe", "pipe", "pipe"],
       });
 
+      // Prevent unhandled stream errors (e.g. write EOF/EPIPE after RTMP disconnect).
+      this.ffmpeg.stdin.on("error", (err) => {
+        console.warn(`⚠️  FFmpeg stdin error [${this.language}]: ${err.message}`);
+      });
+
       this.ffmpeg.on("error", (err) => {
-        console.error(`❌ FFmpeg process error: ${err.message}`);
+        console.error(`❌ FFmpeg process error for ${this.language}: ${err.message}`);
         this.handleStreamError();
       });
 
       this.ffmpeg.on("close", (code) => {
-        console.log(`⛔ FFmpeg closed with code ${code}`);
+        console.log(`⛔ FFmpeg ${this.language.toUpperCase()} closed with code ${code}`);
         this.isRunning = false;
+        this.ffmpeg = null;
         this.handleStreamError();
       });
 
@@ -133,7 +156,7 @@ class IVSTranslatorStreamer {
       this.ffmpeg.stdout.on("data", (data) => {
         const message = data.toString().trim();
         if (message && !message.includes("frame=")) {
-          console.log(`📢 FFmpeg stdout: ${message}`);
+          console.log(`📢 FFmpeg [${this.language.toUpperCase()}] stdout: ${message}`);
         }
       });
 
@@ -145,16 +168,16 @@ class IVSTranslatorStreamer {
           !message.includes("speed=") &&
           !message.includes("Last message repeated")
         ) {
-          console.log(`📢 FFmpeg stderr: ${message}`);
+          console.log(`📢 FFmpeg [${this.language.toUpperCase()}] stderr: ${message}`);
         }
       });
 
       this.isRunning = true;
       this.reconnectAttempts = 0;
-      console.log(`✅ IVS translator stream started: ${streamUrl}`);
+      console.log(`✅ IVS ${this.language.toUpperCase()} translator stream started for session ${session}: ${streamUrl}`);
       return true;
     } catch (err) {
-      console.error(`❌ Failed to start IVS stream: ${err.message}`);
+      console.error(`❌ Failed to start IVS ${this.language} stream: ${err.message}`);
       return false;
     }
   }
@@ -163,11 +186,16 @@ class IVSTranslatorStreamer {
    * Handle stream errors and reconnection
    */
   async handleStreamError() {
+    if (this.isHandlingError) {
+      return;
+    }
+    this.isHandlingError = true;
+
     if (this.ffmpeg && !this.ffmpeg.killed) {
       try {
         this.ffmpeg.kill("SIGTERM");
       } catch (err) {
-        console.error(`⚠️  Error killing FFmpeg: ${err.message}`);
+        console.error(`⚠️  Error killing FFmpeg [${this.language}]: ${err.message}`);
       }
     }
 
@@ -177,16 +205,18 @@ class IVSTranslatorStreamer {
       this.reconnectAttempts++;
       const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1);
       console.log(
-        `🔄 Reconnecting IVS stream in ${delay / 1000}s (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})...`
+        `🔄 Reconnecting IVS ${this.language} stream in ${delay / 1000}s (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})...`
       );
 
       await new Promise((resolve) => setTimeout(resolve, delay));
-      await this.startStream();
+      await this.startStream(this.currentSessionId);
     } else {
       console.error(
-        `❌ Max reconnection attempts (${this.maxReconnectAttempts}) exceeded for IVS stream`
+        `❌ Max reconnection attempts (${this.maxReconnectAttempts}) exceeded for IVS ${this.language} stream`
       );
     }
+
+    this.isHandlingError = false;
   }
 
   /**
@@ -221,7 +251,13 @@ class IVSTranslatorStreamer {
       const audioBuffer = this.audioQueue.shift();
 
       if (!this.isRunning || !this.ffmpeg) {
-        console.warn("⚠️  Stream not running, skipping audio chunk");
+        console.warn(`⚠️  ${this.language.toUpperCase()} stream not running, skipping audio chunk`);
+        this.isProcessingQueue = false;
+        return;
+      }
+
+      if (!this.ffmpeg.stdin || this.ffmpeg.stdin.destroyed || !this.ffmpeg.stdin.writable) {
+        console.warn(`⚠️  ${this.language.toUpperCase()} stdin not writable, skipping audio chunk`);
         this.isProcessingQueue = false;
         return;
       }
@@ -237,9 +273,9 @@ class IVSTranslatorStreamer {
           });
         }
 
-        console.log(`🔊 Sent translated audio chunk (${audioBuffer.length} bytes) to IVS`);
+        console.log(`🔊 Sent ${this.language.toUpperCase()} translated audio chunk (${audioBuffer.length} bytes)`);
       } catch (err) {
-        console.error(`❌ Error writing audio to FFmpeg: ${err.message}`);
+        console.error(`❌ Error writing audio to FFmpeg [${this.language}]: ${err.message}`);
         this.handleStreamError();
         this.isProcessingQueue = false;
         return;
@@ -261,7 +297,7 @@ class IVSTranslatorStreamer {
    * Stop the stream gracefully
    */
   async stopStream() {
-    console.log("🛑 Stopping IVS translator stream...");
+    console.log(`🛑 Stopping IVS ${this.language.toUpperCase()} translator stream...`);
 
     this.isRunning = false;
 
@@ -273,7 +309,7 @@ class IVSTranslatorStreamer {
         // Wait for process to close with timeout
         await new Promise((resolve) => {
           const timeout = setTimeout(() => {
-            console.warn("⚠️  FFmpeg timeout, force killing...");
+            console.warn(`⚠️  FFmpeg [${this.language}] timeout, force killing...`);
             this.ffmpeg.kill("SIGKILL");
             resolve();
           }, 5000);
@@ -284,10 +320,19 @@ class IVSTranslatorStreamer {
           });
         });
 
-        console.log("✅ IVS translator stream stopped");
+        console.log(`✅ IVS ${this.language.toUpperCase()} translator stream stopped`);
       } catch (err) {
-        console.error(`⚠️  Error stopping stream: ${err.message}`);
+        console.error(`⚠️  Error stopping ${this.language} stream: ${err.message}`);
       }
+    }
+  }
+
+  /**
+   * Stop stream for a specific session
+   */
+  async stopStreamForSession(sessionId) {
+    if (this.currentSessionId === sessionId) {
+      await this.stopStream();
     }
   }
 
@@ -296,11 +341,13 @@ class IVSTranslatorStreamer {
    */
   getStatus() {
     return {
+      language: this.language,
       isRunning: this.isRunning,
       queueLength: this.audioQueue.length,
       reconnectAttempts: this.reconnectAttempts,
       maxReconnectAttempts: this.maxReconnectAttempts,
       streamUrl: this.getStreamUrl(),
+      currentSessionId: this.currentSessionId,
     };
   }
 }

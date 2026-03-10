@@ -5,7 +5,9 @@ import ffmpegPath from "ffmpeg-static";
 import fs from "fs";
 import path from "path";
 import { SarvamAIClient } from "sarvamai";
+import { WaveFile } from "wavefile";
 import IVSTranslatorStreamer from "./ivsTranslatorStreamer.js";
+import StreamSessionManager from "./StreamSessionManager.js";
 
 dotenv.config();
 
@@ -18,9 +20,14 @@ app.set("view engine", "ejs");
 
 const SEGMENT_FOLDER = "./audio_chunks";
 const TRANSLATED_AUDIO_FOLDER = "./translated_audio";
+const HOLD_AUDIO_FILE = path.join("public", "speech.mp3");
 const MAX_RESTART_RETRIES = 5;
 const CHUNK_SCAN_INTERVAL_MS = 2000;
 const MAX_CHUNK_RETRIES = 2;
+const HOLD_AUDIO_PUSH_INTERVAL_MS = 4000;
+const TARGET_CHUNK_DURATION_SEC = 60;
+const MIN_ACCEPTABLE_CHUNK_DURATION_SEC = 58;
+const SHORT_CHUNK_SKIP_AGE_MS = 90 * 1000;
 let restartAttempts = 0;
 let lastRestartTime = 0;
 
@@ -28,8 +35,15 @@ const sarvamClient = process.env.SARVAM_API_KEY
   ? new SarvamAIClient({ apiSubscriptionKey: process.env.SARVAM_API_KEY })
   : null;
 
-// Initialize IVS Translator Streamer
-const ivsStreamer = new IVSTranslatorStreamer();
+// Initialize Session Manager
+const sessionManager = new StreamSessionManager();
+
+// Initialize IVS Translator Streamers for each language
+const ivsStreamers = {
+  hindi: new IVSTranslatorStreamer({ language: 'hindi' }),
+  bangla: new IVSTranslatorStreamer({ language: 'bangla' }),
+  tamil: new IVSTranslatorStreamer({ language: 'tamil' }),
+};
 
 const chunkQueue = [];
 const queuedChunks = new Set();
@@ -38,6 +52,9 @@ const failedChunkRetries = new Map();
 const transcriptResults = [];
 let isChunkWorkerRunning = false;
 let chunkScannerTimer;
+let holdAudioLoopTimer;
+let holdAudioPcmBuffer = null;
+let isSarvamProcessingChunk = false;
 
 // create folders if not exist
 if (!fs.existsSync(SEGMENT_FOLDER)) {
@@ -69,6 +86,101 @@ function extractTranscriptText(response) {
   );
 }
 
+function ffmpegCollectOutput(args) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(ffmpegPath, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    const chunks = [];
+    let stderr = "";
+
+    proc.stdout.on("data", (data) => chunks.push(data));
+    proc.stderr.on("data", (data) => {
+      stderr += data.toString();
+    });
+
+    proc.on("error", reject);
+    proc.on("close", (code) => {
+      if (code === 0) {
+        resolve(Buffer.concat(chunks));
+        return;
+      }
+
+      reject(new Error(`FFmpeg exited with code ${code}: ${stderr.trim()}`));
+    });
+  });
+}
+
+async function loadHoldAudioBuffer() {
+  if (!fs.existsSync(HOLD_AUDIO_FILE)) {
+    console.warn(
+      `⚠️  Hold audio file not found: ${HOLD_AUDIO_FILE}. Waiting mode filler is disabled.`
+    );
+    return null;
+  }
+
+  try {
+    const pcm = await ffmpegCollectOutput([
+      "-i",
+      HOLD_AUDIO_FILE,
+      "-f",
+      "s16le",
+      "-ar",
+      "16000",
+      "-ac",
+      "1",
+      "pipe:1",
+    ]);
+
+    console.log(`🎵 Loaded hold audio from ${HOLD_AUDIO_FILE}`);
+    return pcm;
+  } catch (err) {
+    console.error(`❌ Failed to load hold audio ${HOLD_AUDIO_FILE}: ${err.message}`);
+    return null;
+  }
+}
+
+function shouldSendHoldAudio() {
+  return !isSarvamProcessingChunk && chunkQueue.length === 0;
+}
+
+async function pushHoldAudioToTranslationStreams() {
+  if (!holdAudioPcmBuffer || !shouldSendHoldAudio()) {
+    return;
+  }
+
+  const targets = ["hindi", "bangla", "tamil"];
+  for (const language of targets) {
+    const streamer = ivsStreamers[language];
+    if (!streamer || !streamer.isRunning) {
+      continue;
+    }
+
+    // Avoid queue pile-up if network is slow/reconnecting.
+    if (streamer.audioQueue.length > 2) {
+      continue;
+    }
+
+    await streamer.sendTranslatedAudioChunk(Buffer.from(holdAudioPcmBuffer));
+    console.log(`🎙️  Hold audio pushed to ${language.toUpperCase()} stream`);
+  }
+}
+
+function startHoldAudioLoop() {
+  if (holdAudioLoopTimer) {
+    return;
+  }
+
+  holdAudioLoopTimer = setInterval(() => {
+    pushHoldAudioToTranslationStreams().catch((err) => {
+      console.error(`⚠️  Hold audio loop failed: ${err.message}`);
+    });
+  }, HOLD_AUDIO_PUSH_INTERVAL_MS);
+
+  console.log("🎛️  Hold audio loop started");
+}
+
   async function translateTextToEnglish(inputText, sourceLanguageCode) {
     if (!inputText) return "";
 
@@ -88,13 +200,79 @@ function extractTranscriptText(response) {
     return normalizeText(translationResponse?.translated_text);
   }
 
-  async function convertTextToSpeech(text, chunkName) {
+  /**
+   * Translate text to Hindi, Bangla, and Tamil
+   */
+  async function translateToMultipleLanguages(inputText, sourceLanguageCode) {
+    if (!inputText) {
+      return {
+        hindi: "",
+        bangla: "",
+        tamil: "",
+      };
+    }
+
+    const normalizedSourceLanguage = /^[a-z]{2,3}-IN$/i.test(
+      sourceLanguageCode || ""
+    )
+      ? sourceLanguageCode
+      : "auto";
+
+    const translations = {
+      hindi: "",
+      bangla: "",
+      tamil: "",
+    };
+
+    try {
+      // Translate to Hindi
+      const hindiResponse = await sarvamClient.text.translate({
+        input: inputText,
+        source_language_code: normalizedSourceLanguage,
+        target_language_code: "hi-IN",
+        model: "sarvam-translate:v1",
+      });
+      translations.hindi = normalizeText(hindiResponse?.translated_text);
+    } catch (err) {
+      console.error(`⚠️  Hindi translation failed: ${err.message}`);
+    }
+
+    try {
+      // Translate to Bangla
+      const banglaResponse = await sarvamClient.text.translate({
+        input: inputText,
+        source_language_code: normalizedSourceLanguage,
+        target_language_code: "bn-IN",
+        model: "sarvam-translate:v1",
+      });
+      translations.bangla = normalizeText(banglaResponse?.translated_text);
+    } catch (err) {
+      console.error(`⚠️  Bangla translation failed: ${err.message}`);
+    }
+
+    try {
+      // Translate to Tamil
+      const tamilResponse = await sarvamClient.text.translate({
+        input: inputText,
+        source_language_code: normalizedSourceLanguage,
+        target_language_code: "ta-IN",
+        model: "sarvam-translate:v1",
+      });
+      translations.tamil = normalizeText(tamilResponse?.translated_text);
+    } catch (err) {
+      console.error(`⚠️  Tamil translation failed: ${err.message}`);
+    }
+
+    return translations;
+  }
+
+  async function convertTextToSpeech(text, chunkName, languageCode = "en-IN") {
     if (!text || !sarvamClient) return { audioPath: null, audioBuffer: null };
 
     try {
       const ttsResponse = await sarvamClient.textToSpeech.convert({
         text: text,
-        target_language_code: "en-IN",
+        target_language_code: languageCode,
         speaker: "anushka",
         pitch: 0,
         pace: 1.0,
@@ -110,7 +288,8 @@ function extractTranscriptText(response) {
         
         // Generate output filename based on original chunk name
         const baseName = path.basename(chunkName, path.extname(chunkName));
-        const outputPath = path.join(TRANSLATED_AUDIO_FOLDER, `${baseName}_translated.wav`);
+        const langSuffix = languageCode.split("-")[0]; // Extract language code (e.g., 'hi' from 'hi-IN')
+        const outputPath = path.join(TRANSLATED_AUDIO_FOLDER, `${baseName}_${langSuffix}.wav`);
         
         fs.writeFileSync(outputPath, audioBuffer);
         console.log(`🔊 TTS audio saved: ${outputPath}`);
@@ -118,7 +297,7 @@ function extractTranscriptText(response) {
       }
       return { audioPath: null, audioBuffer: null };
     } catch (err) {
-      console.error(`❌ TTS conversion failed for ${chunkName}: ${err.message}`);
+      console.error(`❌ TTS conversion failed for ${chunkName} (${languageCode}): ${err.message}`);
       return { audioPath: null, audioBuffer: null };
     }
   }
@@ -142,6 +321,58 @@ async function isChunkFileStable(filePath) {
   }
 }
 
+function estimateDurationFromFileSize(filePath) {
+  try {
+    const stats = fs.statSync(filePath);
+    const approxHeaderBytes = 44;
+    const pcmBytesPerSecond = 16000 * 1 * 2; // 16kHz mono s16le
+    const pcmPayloadBytes = Math.max(0, stats.size - approxHeaderBytes);
+    return pcmPayloadBytes / pcmBytesPerSecond;
+  } catch {
+    return 0;
+  }
+}
+
+function getWavDurationSeconds(filePath) {
+  try {
+    const wavBuffer = fs.readFileSync(filePath);
+    const wav = new WaveFile(wavBuffer);
+
+    const sampleRate = wav?.fmt?.sampleRate || 16000;
+    const bitsPerSample = wav?.fmt?.bitsPerSample || 16;
+    const numChannels = wav?.fmt?.numChannels || 1;
+    const bytesPerSamplePerChannel = bitsPerSample / 8;
+    const totalSamples =
+      wav.data.samples.length / (bytesPerSamplePerChannel * numChannels);
+
+    return totalSamples / sampleRate;
+  } catch {
+    // Fallback for partially written WAV headers or parse failures.
+    return estimateDurationFromFileSize(filePath);
+  }
+}
+
+function getChunkReadiness(filePath) {
+  const durationSec = getWavDurationSeconds(filePath);
+
+  if (durationSec >= MIN_ACCEPTABLE_CHUNK_DURATION_SEC) {
+    return { ready: true, durationSec, shouldSkip: false };
+  }
+
+  try {
+    const stats = fs.statSync(filePath);
+    const ageMs = Date.now() - stats.mtimeMs;
+
+    if (ageMs > SHORT_CHUNK_SKIP_AGE_MS) {
+      return { ready: false, durationSec, shouldSkip: true };
+    }
+  } catch {
+    // Ignore stat errors and treat as not ready.
+  }
+
+  return { ready: false, durationSec, shouldSkip: false };
+}
+
 function scanForNewChunks() {
   try {
     const files = fs
@@ -162,6 +393,10 @@ async function processChunkQueue() {
   if (isChunkWorkerRunning || !sarvamClient) return;
   isChunkWorkerRunning = true;
 
+  // Get or create current session
+  const currentSession = sessionManager.getCurrentSession();
+  const sessionId = currentSession.sessionId;
+
   while (chunkQueue.length > 0) {
     const chunkPath = chunkQueue.shift();
     queuedChunks.delete(chunkPath);
@@ -176,59 +411,146 @@ async function processChunkQueue() {
       continue;
     }
 
+    const readiness = getChunkReadiness(chunkPath);
+    if (!readiness.ready) {
+      if (readiness.shouldSkip) {
+        console.warn(
+          `⏭️  Skipping short stale chunk ${path.basename(chunkPath)} (${readiness.durationSec.toFixed(2)}s < ${TARGET_CHUNK_DURATION_SEC}s)`
+        );
+        processedChunks.add(chunkPath);
+      } else {
+        console.log(
+          `⏳ Waiting for full chunk ${path.basename(chunkPath)} (${readiness.durationSec.toFixed(2)}s / ${TARGET_CHUNK_DURATION_SEC}s)`
+        );
+        enqueueChunkForTranscription(chunkPath);
+      }
+      continue;
+    }
+
     try {
-        const sttResponse = await sarvamClient.speechToText.transcribe({
+      isSarvamProcessingChunk = true;
+
+      // Step 1: Transcribe with language detection
+      const sttResponse = await sarvamClient.speechToText.transcribe({
         file: fs.createReadStream(chunkPath),
-          language_code: "unknown",
+        language_code: "unknown",
       });
 
-        const sourceText = extractTranscriptText(sttResponse);
-        const sourceLanguageCode = sttResponse?.language_code || "auto";
-        const translatedText = await translateTextToEnglish(sourceText, sourceLanguageCode);
+      const sourceText = extractTranscriptText(sttResponse);
+      const sourceLanguageCode = sttResponse?.language_code || "auto";
+      
+      // Update session with detected language
+      sessionManager.setSourceLanguage(sessionId, sourceLanguageCode);
 
-        const englishText = translatedText || "[empty response]";
       const chunkName = path.basename(chunkPath);
 
-      // Convert translated English text to speech
-      const ttsResult = await convertTextToSpeech(englishText, chunkName);
-      const { audioPath, audioBuffer } = ttsResult;
-
-      // Send translated audio to IVS stream
-      if (audioBuffer && ivsStreamer.isRunning) {
-        await ivsStreamer.sendTranslatedAudioChunk(audioBuffer);
+      if (!sourceText || sourceText === "[empty response]") {
+        console.log(`⏭️  Skipping empty transcription for ${chunkName}`);
+        processedChunks.add(chunkPath);
+        isSarvamProcessingChunk = false;
+        continue;
       }
+
+      // Step 2: Translate to all three languages
+      console.log(`🔄 Translating "${sourceText.substring(0, 50)}..." from ${sourceLanguageCode} to Hindi, Bangla, Tamil...`);
+      const translations = await translateToMultipleLanguages(sourceText, sourceLanguageCode);
+
+      // Ensure streams are started for this session
+      if (!sessionManager.isStreamActive("hindi") && translations.hindi) {
+        console.log(`🎬 Starting Hindi stream for session ${sessionId}`);
+        await ivsStreamers.hindi.startStream(sessionId);
+        sessionManager.markStreamActive(sessionId, "hindi");
+      }
+
+      if (!sessionManager.isStreamActive("bangla") && translations.bangla) {
+        console.log(`🎬 Starting Bangla stream for session ${sessionId}`);
+        await ivsStreamers.bangla.startStream(sessionId);
+        sessionManager.markStreamActive(sessionId, "bangla");
+      }
+
+      if (!sessionManager.isStreamActive("tamil") && translations.tamil) {
+        console.log(`🎬 Starting Tamil stream for session ${sessionId}`);
+        await ivsStreamers.tamil.startStream(sessionId);
+        sessionManager.markStreamActive(sessionId, "tamil");
+      }
+
+      // Step 3: Convert translations to speech and send to IVS
+      const translatedAudios = {};
+
+      // Hindi
+      if (translations.hindi) {
+        const hindiTts = await convertTextToSpeech(translations.hindi, chunkName, "hi-IN");
+        if (hindiTts.audioBuffer && ivsStreamers.hindi.isRunning) {
+          await ivsStreamers.hindi.sendTranslatedAudioChunk(hindiTts.audioBuffer);
+          sessionManager.incrementChunkCount(sessionId, "hindi");
+          translatedAudios.hindi = {
+            text: translations.hindi,
+            audioPath: hindiTts.audioPath,
+          };
+        }
+      }
+
+      // Bangla
+      if (translations.bangla) {
+        const banglaTts = await convertTextToSpeech(translations.bangla, chunkName, "bn-IN");
+        if (banglaTts.audioBuffer && ivsStreamers.bangla.isRunning) {
+          await ivsStreamers.bangla.sendTranslatedAudioChunk(banglaTts.audioBuffer);
+          sessionManager.incrementChunkCount(sessionId, "bangla");
+          translatedAudios.bangla = {
+            text: translations.bangla,
+            audioPath: banglaTts.audioPath,
+          };
+        }
+      }
+
+      // Tamil
+      if (translations.tamil) {
+        const tamilTts = await convertTextToSpeech(translations.tamil, chunkName, "ta-IN");
+        if (tamilTts.audioBuffer && ivsStreamers.tamil.isRunning) {
+          await ivsStreamers.tamil.sendTranslatedAudioChunk(tamilTts.audioBuffer);
+          sessionManager.incrementChunkCount(sessionId, "tamil");
+          translatedAudios.tamil = {
+            text: translations.tamil,
+            audioPath: tamilTts.audioPath,
+          };
+        }
+      }
+
+      sessionManager.incrementChunkCount(sessionId, "source");
 
       transcriptResults.push({
         chunk: chunkName,
-          sourceLanguageCode,
-          sourceText,
-          englishText,
-          text: englishText,
-          sttResponse,
-        translatedAudioPath: audioPath,
+        sessionId: sessionId,
+        sourceLanguageCode,
+        sourceText,
+        translations: translatedAudios,
+        sttResponse,
         at: new Date().toISOString(),
       });
+
       if (transcriptResults.length > 100) {
         transcriptResults.shift();
       }
 
       processedChunks.add(chunkPath);
       failedChunkRetries.delete(chunkPath);
-        console.log(
-          `📝 Sarvam (${chunkName}) [${sourceLanguageCode}] -> EN: ${englishText}`
-        );
+      console.log(
+        `✅ Processed chunk [${chunkName}] [${sourceLanguageCode}] - Translated to Hindi, Bangla, Tamil`
+      );
+      isSarvamProcessingChunk = false;
     } catch (err) {
+      isSarvamProcessingChunk = false;
       const retries = (failedChunkRetries.get(chunkPath) || 0) + 1;
       failedChunkRetries.set(chunkPath, retries);
 
       if (retries <= MAX_CHUNK_RETRIES) {
         console.error(
-          `⚠️  Sarvam failed for ${path.basename(chunkPath)} (retry ${retries}/${MAX_CHUNK_RETRIES}): ${err.message}`
+          `⚠️  Processing failed for ${path.basename(chunkPath)} (retry ${retries}/${MAX_CHUNK_RETRIES}): ${err.message}`
         );
         enqueueChunkForTranscription(chunkPath);
       } else {
         console.error(
-          `❌ Sarvam failed permanently for ${path.basename(chunkPath)}: ${err.message}`
+          `❌ Processing failed permanently for ${path.basename(chunkPath)}: ${err.message}`
         );
         processedChunks.add(chunkPath);
       }
@@ -252,6 +574,16 @@ function startChunkScanner() {
   scanForNewChunks();
   chunkScannerTimer = setInterval(scanForNewChunks, CHUNK_SCAN_INTERVAL_MS);
   console.log("🧠 Sarvam chunk transcription scanner started");
+
+  // Periodic cleanup of expired sessions (every 30 seconds)
+  const sessionCleanupTimer = setInterval(() => {
+    sessionManager.cleanupExpiredSessions();
+  }, 30000);
+
+  // Clean up timer on exit
+  process.on("SIGINT", () => {
+    clearInterval(sessionCleanupTimer);
+  });
 }
 
 /**
@@ -419,11 +751,11 @@ async function startAudioSegmentation() {
     "-ac",
     "1", // Mono
 
-    // Segmentation: 5-second chunks
+    // Segmentation: one complete minute chunk.
     "-f",
     "segment",
     "-segment_time",
-    "5",
+    "60",
     "-segment_format",
     "wav",
     "-reset_timestamps",
@@ -549,6 +881,9 @@ app.get("/health", (req, res) => {
   res.json({
     status: isFFmpegRunning ? "streaming" : "idle",
     ffmpegRunning: isFFmpegRunning,
+    sarvamBusy: isSarvamProcessingChunk,
+    holdAudioEnabled: Boolean(holdAudioPcmBuffer),
+    holdAudioFile: HOLD_AUDIO_FILE,
     chunkCount: chunkCount,
     chunkQueueDepth: chunkQueue.length,
     transcriptCount: transcriptResults.length,
@@ -564,25 +899,73 @@ app.get("/transcripts", (req, res) => {
   });
 });
 
-// Get IVS stream status
+// Get IVS stream status for all languages
 app.get("/ivs/status", (req, res) => {
-  res.json(ivsStreamer.getStatus());
+  const statuses = {
+    hindi: ivsStreamers.hindi.getStatus(),
+    bangla: ivsStreamers.bangla.getStatus(),
+    tamil: ivsStreamers.tamil.getStatus(),
+    session: sessionManager.getCurrentSession(),
+  };
+  res.json(statuses);
 });
 
-// Start IVS stream manually
+// Get all sessions
+app.get("/sessions", (req, res) => {
+  res.json({
+    activeSessions: sessionManager.getAllSessions(),
+    currentSessionId: sessionManager.activeSession,
+  });
+});
+
+// Start IVS streams manually
 app.post("/ivs/start", async (req, res) => {
-  const success = await ivsStreamer.startStream();
-  if (success) {
-    res.json({ message: "IVS stream started", status: ivsStreamer.getStatus() });
+  const session = sessionManager.getCurrentSession();
+  const sessionId = session.sessionId;
+
+  const startPromises = [
+    ivsStreamers.hindi.startStream(sessionId),
+    ivsStreamers.bangla.startStream(sessionId),
+    ivsStreamers.tamil.startStream(sessionId),
+  ];
+
+  const results = await Promise.all(startPromises);
+  const allSuccess = results.every((r) => r);
+
+  if (allSuccess) {
+    sessionManager.markStreamActive(sessionId, "hindi");
+    sessionManager.markStreamActive(sessionId, "bangla");
+    sessionManager.markStreamActive(sessionId, "tamil");
+    res.json({
+      message: "All IVS streams started",
+      sessionId: sessionId,
+      statuses: {
+        hindi: ivsStreamers.hindi.getStatus(),
+        bangla: ivsStreamers.bangla.getStatus(),
+        tamil: ivsStreamers.tamil.getStatus(),
+      },
+    });
   } else {
-    res.status(400).json({ error: "Failed to start IVS stream" });
+    res.status(400).json({ error: "Failed to start some IVS streams" });
   }
 });
 
-// Stop IVS stream manually
+// Stop IVS streams manually
 app.post("/ivs/stop", async (req, res) => {
-  await ivsStreamer.stopStream();
-  res.json({ message: "IVS stream stopped" });
+  const sessionId = sessionManager.activeSession;
+  await Promise.all([
+    ivsStreamers.hindi.stopStream(),
+    ivsStreamers.bangla.stopStream(),
+    ivsStreamers.tamil.stopStream(),
+  ]);
+
+  if (sessionId) {
+    sessionManager.markStreamInactive(sessionId, "hindi");
+    sessionManager.markStreamInactive(sessionId, "bangla");
+    sessionManager.markStreamInactive(sessionId, "tamil");
+  }
+
+  res.json({ message: "All IVS streams stopped" });
 });
 
 // Start stream manually
@@ -630,6 +1013,9 @@ app.listen(PORT, async () => {
   );
   console.log(`📁 Audio chunks saved to: ${SEGMENT_FOLDER}\n`);
 
+  holdAudioPcmBuffer = await loadHoldAudioBuffer();
+  startHoldAudioLoop();
+
   const streamURL = getStreamURL();
   
   // Start FFmpeg if URL is available (AWS IVS or test mode)
@@ -647,13 +1033,41 @@ app.listen(PORT, async () => {
     startChunkScanner();
   }
 
-  // Start IVS translator stream if configured
-  if (process.env.AWS_IVS_INGEST_URL && process.env.AWS_IVS_STREAM_KEY) {
-    console.log("🎥 Starting IVS translator stream...");
-    await ivsStreamer.startStream();
+  // Start IVS translator streams if configured
+  const hindiConfigured = process.env.AWS_IVS_INGEST_URL_HINDI && process.env.AWS_IVS_STREAM_KEY_HINDI;
+  const banglaConfigured = process.env.AWS_IVS_INGEST_URL_BANGLA && process.env.AWS_IVS_STREAM_KEY_BANGLA;
+  const tamilConfigured = process.env.AWS_IVS_INGEST_URL_TAMIL && process.env.AWS_IVS_STREAM_KEY_TAMIL;
+
+  if (hindiConfigured || banglaConfigured || tamilConfigured) {
+    const session = sessionManager.getCurrentSession();
+    const sessionId = session.sessionId;
+
+    if (hindiConfigured) {
+      console.log("🎥 Starting IVS Hindi translator stream...");
+      await ivsStreamers.hindi.startStream(sessionId);
+      sessionManager.markStreamActive(sessionId, "hindi");
+    } else {
+      console.log("⏸️  AWS IVS Hindi translator stream not configured.");
+    }
+
+    if (banglaConfigured) {
+      console.log("🎥 Starting IVS Bangla translator stream...");
+      await ivsStreamers.bangla.startStream(sessionId);
+      sessionManager.markStreamActive(sessionId, "bangla");
+    } else {
+      console.log("⏸️  AWS IVS Bangla translator stream not configured.");
+    }
+
+    if (tamilConfigured) {
+      console.log("🎥 Starting IVS Tamil translator stream...");
+      await ivsStreamers.tamil.startStream(sessionId);
+      sessionManager.markStreamActive(sessionId, "tamil");
+    } else {
+      console.log("⏸️  AWS IVS Tamil translator stream not configured.");
+    }
   } else {
-    console.log("⏸️  AWS IVS translator stream not configured.");
-    console.log(" To enable: Set AWS_IVS_INGEST_URL and AWS_IVS_STREAM_KEY in .env");
+    console.log("⏸️  AWS IVS translator streams not configured.");
+    console.log(" To enable: Set AWS_IVS_INGEST_URL_* and AWS_IVS_STREAM_KEY_* in .env");
   }
 });
 
@@ -663,10 +1077,19 @@ process.on("SIGINT", async () => {
   if (chunkScannerTimer) {
     clearInterval(chunkScannerTimer);
   }
+  if (holdAudioLoopTimer) {
+    clearInterval(holdAudioLoopTimer);
+  }
   if (ffmpeg && !ffmpeg.killed) {
     ffmpeg.kill("SIGTERM");
   }
-  // Stop IVS stream
-  await ivsStreamer.stopStream();
+  // Stop all IVS streams
+  await Promise.all([
+    ivsStreamers.hindi.stopStream(),
+    ivsStreamers.bangla.stopStream(),
+    ivsStreamers.tamil.stopStream(),
+  ]);
+  // Cleanup expired sessions
+  sessionManager.endAllSessions();
   process.exit(0);
 });
