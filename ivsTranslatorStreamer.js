@@ -93,6 +93,8 @@ class IVSTranslatorStreamer {
     const useSourceVideo = Boolean(this.sourceVideoUrl);
     if (useSourceVideo) {
       ffmpegArgs.push(
+        "-thread_queue_size",
+        "1024",
         "-itsoffset",
         String(Math.max(0, this.videoSyncDelaySec)),
         "-fflags",

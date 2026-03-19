@@ -43,6 +43,21 @@ const sessionManager = new StreamSessionManager();
 
 const SOURCE_VIDEO_URL = process.env.AWS_IVS_PLAYBACK_URL || process.env.LIVESTREAM_HLS_URL || "";
 const VIDEO_SYNC_DELAY_SEC = Number(process.env.VIDEO_SYNC_DELAY_SEC || 6);
+const DEFAULT_PLAYBACK_BASE_URL = "https://a7936abd8b67.ap-south-1.playback.live-video.net";
+const PLAYBACK_BASE_URL = (
+  process.env.CLOUDFRONT_PLAYBACK_BASE_URL || process.env.PLAYBACK_BASE_URL || DEFAULT_PLAYBACK_BASE_URL
+).replace(/\/$/, "");
+
+const PLAYBACK_CHANNEL_PATHS = {
+  original: "/api/video/v1/ap-south-1.281851731848.channel.UqVC4zjntu05.m3u8",
+  hindi: "/api/video/v1/ap-south-1.281851731848.channel.dAAx194gnHFl.m3u8",
+  bangla: "/api/video/v1/ap-south-1.281851731848.channel.kNFMdB3tnh8N.m3u8",
+  tamil: "/api/video/v1/ap-south-1.281851731848.channel.EPjg42C0o1hv.m3u8",
+};
+
+function buildPlaybackUrl(channelPath) {
+  return `${PLAYBACK_BASE_URL}${channelPath}`;
+}
 
 // Initialize IVS Translator Streamers for each language
 const ivsStreamers = {
@@ -976,7 +991,15 @@ async function startAudioSegmentation() {
 // ============================================
 
 app.get("/", (req, res) => {
-  res.render("home.ejs");
+  res.render("home.ejs", {
+    streamUrls: {
+      original: buildPlaybackUrl(PLAYBACK_CHANNEL_PATHS.original),
+      hindi: buildPlaybackUrl(PLAYBACK_CHANNEL_PATHS.hindi),
+      bangla: buildPlaybackUrl(PLAYBACK_CHANNEL_PATHS.bangla),
+      tamil: buildPlaybackUrl(PLAYBACK_CHANNEL_PATHS.tamil),
+    },
+    playbackBaseUrl: PLAYBACK_BASE_URL,
+  });
 });
 
 app.get("/create-new-livestream", (req, res) => {
