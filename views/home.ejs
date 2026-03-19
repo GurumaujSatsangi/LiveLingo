@@ -10,18 +10,37 @@
 <body>
 
   <select id="languages" name="language-select">
-    <option value="hindi">Hindi / हिन्दी</option>
-    <option value="bangla">Bangla / বাংলা</option>
-    <option value="tamil">Tamil / தமிழ்</option>
+    <option value="https://a7936abd8b67.ap-south-1.playback.live-video.net/api/video/v1/ap-south-1.281851731848.channel.UqVC4zjntu05.m3u8">Original Stream</option>
+    <option value="https://a7936abd8b67.ap-south-1.playback.live-video.net/api/video/v1/ap-south-1.281851731848.channel.dAAx194gnHFl.m3u8">Hindi / हिन्दी</option>
+    <option value="https://a7936abd8b67.ap-south-1.playback.live-video.net/api/video/v1/ap-south-1.281851731848.channel.kNFMdB3tnh8N.m3u8">Bangla / বাংলা</option>
+    <option value="https://a7936abd8b67.ap-south-1.playback.live-video.net/api/video/v1/ap-south-1.281851731848.channel.EPjg42C0o1hv.m3u8">Tamil / தமிழ்</option>
   </select>
 
 
 
 <video-player>
   <video-skin>
-    <video poster="poster.png" autoplay slot="media" src="https://a7936abd8b67.ap-south-1.playback.live-video.net/api/video/v1/ap-south-1.281851731848.channel.UqVC4zjntu05.m3u8" playsinline></video>
+    <video  id="video-player" autoplay slot="media" src="https://a7936abd8b67.ap-south-1.playback.live-video.net/api/video/v1/ap-south-1.281851731848.channel.UqVC4zjntu05.m3u8" playsinline></video>
   </video-skin>
 </video-player>
+
+<script>
+
+const dropdown = document.getElementById('languages');
+const videoPlayer = document.getElementById('video-player');
+
+
+dropdown.addEventListener('change', (event) => {
+  const selectedValue = event.target.value;
+  videoPlayer.src = selectedValue;
+  videoPlayer.load();
+  videoPlayer.play();
+
+
+});
+
+
+</script>
 
 
 </body>
