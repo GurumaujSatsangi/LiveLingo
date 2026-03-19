@@ -3,18 +3,26 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Document</title>
+    <title>LiveLingo</title>
+    <script type="module" src="https://cdn.jsdelivr.net/npm/@videojs/html/cdn/video.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@videojs/html/cdn/video.css" />
 </head>
 <body>
-    <h1>Welcome to LiveLingo!</h1>
 
-    <table style="border: 1px solid black">
+  <select id="languages" name="language-select">
+    <option value="hindi">Hindi / हिन्दी</option>
+    <option value="bangla">Bangla / বাংলা</option>
+    <option value="tamil">Tamil / தமிழ்</option>
+  </select>
 
-        <tr>
-            <td><a href="/dashboard">Watch Live Stream</a></td>
-            <td><a href="/create-new-livestream">Create New Livestream</a></td>
-        </tr>
-    </table>
-    
+
+
+<video-player>
+  <video-skin>
+    <video poster="poster.png" autoplay slot="media" src="https://a7936abd8b67.ap-south-1.playback.live-video.net/api/video/v1/ap-south-1.281851731848.channel.UqVC4zjntu05.m3u8" playsinline></video>
+  </video-skin>
+</video-player>
+
+
 </body>
 </html>

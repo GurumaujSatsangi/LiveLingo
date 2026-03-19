@@ -14,6 +14,11 @@ class IVSTranslatorStreamer {
     // RTMP configuration - can be language-specific
     this.rtmpUrl = options.rtmpUrl || process.env[`AWS_IVS_INGEST_URL_${this.language.toUpperCase()}`] || process.env.AWS_IVS_INGEST_URL;
     this.streamKey = options.streamKey || process.env[`AWS_IVS_STREAM_KEY_${this.language.toUpperCase()}`] || process.env.AWS_IVS_STREAM_KEY;
+    this.sourceVideoUrl = options.sourceVideoUrl || process.env.AWS_IVS_PLAYBACK_URL || process.env.LIVESTREAM_HLS_URL || "";
+    this.videoSyncDelaySec =
+      typeof options.videoSyncDelaySec === "number"
+        ? options.videoSyncDelaySec
+        : Number(process.env.VIDEO_SYNC_DELAY_SEC || 6);
     
     // Session management
     this.currentSessionId = null;
@@ -37,7 +42,7 @@ class IVSTranslatorStreamer {
     this.fallbackPcmBuffer = null;
     this.fallbackOffset = 0;
     this.missingSequenceSince = null;
-    this.maxMissingSequenceWaitMs = options.maxMissingSequenceWaitMs || 800;
+    this.maxMissingSequenceWaitMs = options.maxMissingSequenceWaitMs || 300;
 
     console.log(`🎯 IVS Translator Streamer initialized for: ${this.language.toUpperCase()}`);
   }
@@ -79,14 +84,38 @@ class IVSTranslatorStreamer {
 
     console.log(`🚀 Starting IVS ${this.language.toUpperCase()} translator stream for session ${session}...`);
 
-    // FFmpeg command to stream dummy video + audio to AWS IVS
+    // FFmpeg command to stream source video + translated audio to AWS IVS.
     const ffmpegArgs = [
-      // Video input: black screen (1280x720)
-      "-f",
-      "lavfi",
-      "-i",
-      "color=c=black:s=1280x720:d=2147483", // ~24 days duration to keep stream continuous
+      "-loglevel",
+      "warning",
+    ];
 
+    const useSourceVideo = Boolean(this.sourceVideoUrl);
+    if (useSourceVideo) {
+      ffmpegArgs.push(
+        "-itsoffset",
+        String(Math.max(0, this.videoSyncDelaySec)),
+        "-fflags",
+        "+genpts+discardcorrupt",
+        "-flags",
+        "low_delay",
+        "-reconnect",
+        "1",
+        "-reconnect_streamed",
+        "1",
+        "-reconnect_on_network_error",
+        "1",
+        "-reconnect_delay_max",
+        "2",
+        "-i",
+        this.sourceVideoUrl
+      );
+    } else {
+      // Fallback if source video is unavailable.
+      ffmpegArgs.push("-f", "lavfi", "-i", "color=c=black:s=1280x720:d=2147483");
+    }
+
+    ffmpegArgs.push(
       // Audio input: read from stdin as PCM s16le
       "-f",
       "s16le",
@@ -97,21 +126,39 @@ class IVSTranslatorStreamer {
       "-thread_queue_size",
       "1024",
       "-i",
-      "pipe:0",
+      "pipe:0"
+    );
 
-      // Video codec settings
-      "-c:v",
-      "libx264",
-      "-preset",
-      "ultrafast",
-      "-b:v",
-      "2500k",
-      "-maxrate",
-      "3000k",
-      "-bufsize",
-      "6000k",
-      "-pix_fmt",
-      "yuv420p",
+    if (useSourceVideo) {
+      ffmpegArgs.push(
+        // Keep input video quality/profile as-is where possible.
+        "-map",
+        "0:v:0",
+        "-c:v",
+        "copy"
+      );
+    } else {
+      ffmpegArgs.push(
+        "-map",
+        "0:v:0",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-b:v",
+        "2500k",
+        "-maxrate",
+        "3000k",
+        "-bufsize",
+        "6000k",
+        "-pix_fmt",
+        "yuv420p"
+      );
+    }
+
+    ffmpegArgs.push(
+      "-map",
+      "1:a:0",
 
       // Audio codec settings
       "-c:a",
@@ -120,9 +167,6 @@ class IVSTranslatorStreamer {
       "128k",
       "-ar",
       "44100",
-
-      // Sync audio and video
-      "-shortest",
 
       // Output format and settings
       "-f",
@@ -137,7 +181,7 @@ class IVSTranslatorStreamer {
       "live",
       // Output URL
       streamUrl,
-    ];
+    );
 
     try {
       this.ffmpeg = spawn(ffmpegPath, ffmpegArgs, {
@@ -474,6 +518,8 @@ class IVSTranslatorStreamer {
       reconnectAttempts: this.reconnectAttempts,
       maxReconnectAttempts: this.maxReconnectAttempts,
       streamUrl: this.getStreamUrl(),
+      sourceVideoUrl: this.sourceVideoUrl || null,
+      videoSyncDelaySec: this.videoSyncDelaySec,
       currentSessionId: this.currentSessionId,
     };
   }
