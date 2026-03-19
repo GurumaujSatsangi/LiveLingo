@@ -204,6 +204,26 @@ let dubbingReferenceSamplePath = null;
 let isDubbingReferenceInitialized = false;
 let dubbingReferenceSessionId = null;
 let realtimePipelineTimelineSec = 0;
+const hindiPipelineOutputBuffer = new Map();
+let nextHindiPipelineSeqToSend = 1;
+
+async function flushHindiPipelineOutputBuffer(sessionId, hindiStreamer) {
+  const flushedSeqIds = [];
+
+  while (hindiPipelineOutputBuffer.has(nextHindiPipelineSeqToSend)) {
+    const pcmBuffer = hindiPipelineOutputBuffer.get(nextHindiPipelineSeqToSend);
+    hindiPipelineOutputBuffer.delete(nextHindiPipelineSeqToSend);
+
+    await hindiStreamer.sendTranslatedAudioChunk(pcmBuffer, { seq: nextHindiPipelineSeqToSend });
+    sessionManager.incrementChunkCount(sessionId, "hindi");
+    sessionManager.incrementChunkCount(sessionId, "source");
+
+    flushedSeqIds.push(nextHindiPipelineSeqToSend);
+    nextHindiPipelineSeqToSend += 1;
+  }
+
+  return flushedSeqIds;
+}
 
 // create folders if not exist
 if (!fs.existsSync(SEGMENT_FOLDER)) {
@@ -1874,11 +1894,32 @@ app.post("/pipeline/output/hindi", async (req, res) => {
       return res.status(422).json({ error: "Failed to convert translated audio to PCM" });
     }
 
-    await hindiStreamer.sendTranslatedAudioChunk(pcmBuffer, { seq: sequenceNumber });
-    sessionManager.incrementChunkCount(sessionId, "hindi");
-    sessionManager.incrementChunkCount(sessionId, "source");
+    if (sequenceNumber < nextHindiPipelineSeqToSend) {
+      return res.json({
+        accepted: true,
+        seqId: sequenceNumber,
+        duplicate: true,
+        nextExpectedSeqId: nextHindiPipelineSeqToSend,
+      });
+    }
 
-    return res.json({ accepted: true, seqId: sequenceNumber, bytes: pcmBuffer.length });
+    hindiPipelineOutputBuffer.set(sequenceNumber, pcmBuffer);
+    const flushedSeqIds = await flushHindiPipelineOutputBuffer(sessionId, hindiStreamer);
+
+    if (flushedSeqIds.length > 1) {
+      console.log(
+        `✅ Flushed contiguous Hindi chunks in order: ${flushedSeqIds[0]}..${flushedSeqIds[flushedSeqIds.length - 1]}`
+      );
+    }
+
+    return res.json({
+      accepted: true,
+      seqId: sequenceNumber,
+      bytes: pcmBuffer.length,
+      flushedSeqIds,
+      nextExpectedSeqId: nextHindiPipelineSeqToSend,
+      bufferedCount: hindiPipelineOutputBuffer.size,
+    });
   } catch (err) {
     console.error(`❌ Failed to push realtime pipeline output to Hindi IVS: ${err.message}`);
     return res.status(500).json({ error: err.message });
