@@ -44,9 +44,29 @@ const sessionManager = new StreamSessionManager();
 const SOURCE_VIDEO_URL = process.env.AWS_IVS_PLAYBACK_URL || process.env.LIVESTREAM_HLS_URL || "";
 const VIDEO_SYNC_DELAY_SEC = Number(process.env.VIDEO_SYNC_DELAY_SEC || 6);
 const DEFAULT_PLAYBACK_BASE_URL = "https://a7936abd8b67.ap-south-1.playback.live-video.net";
-const PLAYBACK_BASE_URL = (
+function normalizePlaybackBaseUrl(rawValue) {
+  const value = String(rawValue || "").trim();
+  if (!value) {
+    return DEFAULT_PLAYBACK_BASE_URL;
+  }
+
+  const withProtocol = /^https?:\/\//i.test(value) ? value : `https://${value}`;
+
+  try {
+    const parsed = new URL(withProtocol);
+    const pathname = parsed.pathname === "/" ? "" : parsed.pathname.replace(/\/$/, "");
+    return `${parsed.origin}${pathname}`;
+  } catch (err) {
+    console.warn(
+      `⚠️  Invalid CLOUDFRONT_PLAYBACK_BASE_URL/PLAYBACK_BASE_URL: ${value}. Falling back to default.`
+    );
+    return DEFAULT_PLAYBACK_BASE_URL;
+  }
+}
+
+const PLAYBACK_BASE_URL = normalizePlaybackBaseUrl(
   process.env.CLOUDFRONT_PLAYBACK_BASE_URL || process.env.PLAYBACK_BASE_URL || DEFAULT_PLAYBACK_BASE_URL
-).replace(/\/$/, "");
+);
 
 const PLAYBACK_CHANNEL_PATHS = {
   original: "/api/video/v1/ap-south-1.281851731848.channel.UqVC4zjntu05.m3u8",
@@ -56,7 +76,8 @@ const PLAYBACK_CHANNEL_PATHS = {
 };
 
 function buildPlaybackUrl(channelPath) {
-  return `${PLAYBACK_BASE_URL}${channelPath}`;
+  const normalizedPath = channelPath.startsWith("/") ? channelPath : `/${channelPath}`;
+  return `${PLAYBACK_BASE_URL}${normalizedPath}`;
 }
 
 // Initialize IVS Translator Streamers for each language
