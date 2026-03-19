@@ -1,5 +1,7 @@
 import { spawn } from "child_process";
 import ffmpegPath from "ffmpeg-static";
+import fs from "fs";
+import path from "path";
 
 /**
  * AWS IVS Translator Streamer
@@ -43,8 +45,114 @@ class IVSTranslatorStreamer {
     this.fallbackOffset = 0;
     this.missingSequenceSince = null;
     this.maxMissingSequenceWaitMs = options.maxMissingSequenceWaitMs || 300;
+    this.backgroundMusicEnabled =
+      String(options.backgroundMusicEnabled ?? process.env.BGMUSIC_ENABLED ?? "true").toLowerCase() !== "false";
+    this.backgroundMusicPath =
+      options.backgroundMusicPath ||
+      process.env.BGMUSIC_FILE_PATH ||
+      process.env.BG_MUSIC_FILE_PATH ||
+      "sample/bgmusic.mp3";
+    this.backgroundMusicVolume = Math.max(
+      0,
+      Math.min(1, Number(options.backgroundMusicVolume ?? process.env.BGMUSIC_VOLUME ?? 0.08))
+    );
+    this.backgroundMusicLoaded = false;
+    this.backgroundMusicWarned = false;
 
     console.log(`🎯 IVS Translator Streamer initialized for: ${this.language.toUpperCase()}`);
+  }
+
+  resolveBackgroundMusicPath() {
+    if (!this.backgroundMusicPath) {
+      return null;
+    }
+
+    if (path.isAbsolute(this.backgroundMusicPath)) {
+      return this.backgroundMusicPath;
+    }
+
+    return path.resolve(process.cwd(), this.backgroundMusicPath);
+  }
+
+  async transcodeBackgroundMusicToPcm(filePath) {
+    return new Promise((resolve, reject) => {
+      const args = [
+        "-v",
+        "error",
+        "-stream_loop",
+        "-1",
+        "-i",
+        filePath,
+        "-t",
+        "120",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-filter:a",
+        `volume=${this.backgroundMusicVolume.toFixed(3)}`,
+        "-f",
+        "s16le",
+        "pipe:1",
+      ];
+
+      const proc = spawn(ffmpegPath, args, {
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+
+      const chunks = [];
+      let stderr = "";
+
+      proc.stdout.on("data", (data) => chunks.push(data));
+      proc.stderr.on("data", (data) => {
+        stderr += data.toString();
+      });
+
+      proc.on("error", reject);
+      proc.on("close", (code) => {
+        if (code === 0) {
+          resolve(Buffer.concat(chunks));
+          return;
+        }
+
+        reject(new Error(`FFmpeg bg music transcode exited ${code}: ${stderr.trim()}`));
+      });
+    });
+  }
+
+  async ensureBackgroundMusicFallback() {
+    if (!this.backgroundMusicEnabled || this.backgroundMusicLoaded) {
+      return;
+    }
+
+    const bgMusicPath = this.resolveBackgroundMusicPath();
+    if (!bgMusicPath || !fs.existsSync(bgMusicPath)) {
+      if (!this.backgroundMusicWarned) {
+        console.warn(
+          `⚠️  Background music file not found for ${this.language.toUpperCase()}: ${bgMusicPath || "<empty>"}`
+        );
+        this.backgroundMusicWarned = true;
+      }
+      return;
+    }
+
+    try {
+      const pcmBuffer = await this.transcodeBackgroundMusicToPcm(bgMusicPath);
+      if (!pcmBuffer || pcmBuffer.length === 0) {
+        throw new Error("Transcoded PCM buffer is empty");
+      }
+
+      this.setFallbackAudio(pcmBuffer);
+      this.backgroundMusicLoaded = true;
+      console.log(
+        `🎵 Background music enabled for ${this.language.toUpperCase()} from ${bgMusicPath} at volume ${this.backgroundMusicVolume}`
+      );
+    } catch (err) {
+      if (!this.backgroundMusicWarned) {
+        console.warn(`⚠️  Failed to enable background music [${this.language}]: ${err.message}`);
+        this.backgroundMusicWarned = true;
+      }
+    }
   }
 
   /**
@@ -229,6 +337,7 @@ class IVSTranslatorStreamer {
 
       this.isRunning = true;
       this.reconnectAttempts = 0;
+      await this.ensureBackgroundMusicFallback();
       this.startPlaybackLoop();
       console.log(`✅ IVS ${this.language.toUpperCase()} translator stream started for session ${session}: ${streamUrl}`);
       return true;
