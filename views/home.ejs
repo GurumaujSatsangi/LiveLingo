@@ -1,65 +1,278 @@
 <!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>LiveLingo</title>
-    <link rel="stylesheet" href="/styles.css">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB" crossorigin="anonymous">
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js" integrity="sha384-FKyoEForCGlyvwx9Hj09JcYn3nv7wiPVlz7YYwJrWVcXK/BmnVDxM+D2scQbITxI" crossorigin="anonymous"></script>
 
-<script src="https://cdn.jsdelivr.net/npm/@popperjs/core@2.11.8/dist/umd/popper.min.js" integrity="sha384-I7E8VVD/ismYTF4hNIPjVp/Zjvgyol6VFvRkX/vR+Vc4jQkC+hVqc2pM8ODewa9r" crossorigin="anonymous"></script>
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.min.js" integrity="sha384-G/EV+4j2dNv+tEPo3++6LCgdCROaejBqfUeNjuKAiuXbjrxilcCdDz6ZAVfHWe1Y" crossorigin="anonymous"></script>
-
-
-    <script type="module" src="https://cdn.jsdelivr.net/npm/@videojs/html/cdn/video.js"></script>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@videojs/html/cdn/video.css" />
+<html class="light" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>LiveLingo - Real-time Translation SPA</title>
+<script type="module" src="https://cdn.jsdelivr.net/npm/@videojs/html/cdn/video-minimal.js"></script>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;700;800&amp;family=Inter:wght@300;400;500;600&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+        tailwind.config = {
+            darkMode: "class",
+            theme: {
+                extend: {
+                    colors: {
+                        "outline-variant": "#c6c6c6",
+                        "surface-tint": "#5f5e5e",
+                        "on-tertiary-fixed-variant": "#e4e2e2",
+                        "tertiary-container": "#757474",
+                        "surface-bright": "#f9f9f9",
+                        "primary-container": "#3c3b3b",
+                        "on-primary-fixed-variant": "#e5e2e1",
+                        "on-secondary-container": "#1b1c1c",
+                        "error": "#ba1a1a",
+                        "surface-variant": "#e2e2e2",
+                        "on-tertiary": "#e4e2e2",
+                        "outline": "#777777",
+                        "on-secondary-fixed-variant": "#3b3b3b",
+                        "tertiary-fixed": "#5e5e5e",
+                        "primary-fixed": "#5f5e5e",
+                        "inverse-on-surface": "#f0f1f1",
+                        "on-primary-container": "#ffffff",
+                        "on-tertiary-fixed": "#ffffff",
+                        "error-container": "#ffdad6",
+                        "on-error": "#ffffff",
+                        "surface-container-lowest": "#ffffff",
+                        "on-background": "#1a1c1c",
+                        "secondary": "#5f5e5e",
+                        "secondary-container": "#d6d4d3",
+                        "surface-container-low": "#f3f3f3",
+                        "primary-fixed-dim": "#474746",
+                        "surface": "#f9f9f9",
+                        "inverse-surface": "#2f3131",
+                        "background": "#f9f9f9",
+                        "on-primary-fixed": "#ffffff",
+                        "on-tertiary-container": "#ffffff",
+                        "surface-container": "#eeeeee",
+                        "tertiary-fixed-dim": "#464747",
+                        "secondary-fixed-dim": "#acabab",
+                        "on-surface": "#1a1c1c",
+                        "surface-container-high": "#e8e8e8",
+                        "on-surface-variant": "#474747",
+                        "inverse-primary": "#c8c6c5",
+                        "surface-container-highest": "#e2e2e2",
+                        "secondary-fixed": "#c8c6c6",
+                        "on-primary": "#e5e2e1",
+                        "primary": "#000000",
+                        "on-secondary-fixed": "#1b1c1c",
+                        "on-secondary": "#ffffff",
+                        "surface-dim": "#dadada",
+                        "on-error-container": "#410002",
+                        "tertiary": "#3b3b3b"
+                    },
+                    fontFamily: {
+                        "headline": ["Manrope", "sans-serif"],
+                        "body": ["Inter", "sans-serif"],
+                        "label": ["Inter", "sans-serif"]
+                    },
+                    borderRadius: { "DEFAULT": "0.125rem", "lg": "0.25rem", "xl": "0.5rem", "full": "0.75rem" },
+                },
+            },
+        }
+    </script>
+<style>
+        body { font-family: 'Inter', sans-serif; background-color: #f9f9f9; }
+        .headline-font { font-family: 'Manrope', sans-serif; }
+        .script-ghost {
+            position: fixed;
+            font-size: 15rem;
+            color: #474747;
+            opacity: 0.03;
+            z-index: -1;
+            pointer-events: none;
+            user-select: none;
+        }
+        .material-symbols-outlined {
+            font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+        }
+        /* Hide scrollbars for cleaner SPA feel */
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+    </style>
 </head>
-<body>
-  <div class="container">
-
-  <% const originalUrl = streamUrls?.original || "https://a7936abd8b67.ap-south-1.playback.live-video.net/api/video/v1/ap-south-1.281851731848.channel.UqVC4zjntu05.m3u8"; %>
-  <% const hindiUrl = streamUrls?.hindi || "https://a7936abd8b67.ap-south-1.playback.live-video.net/api/video/v1/ap-south-1.281851731848.channel.dAAx194gnHFl.m3u8"; %>
-  <% const banglaUrl = streamUrls?.bangla || "https://a7936abd8b67.ap-south-1.playback.live-video.net/api/video/v1/ap-south-1.281851731848.channel.kNFMdB3tnh8N.m3u8"; %>
-  <% const tamilUrl = streamUrls?.tamil || "https://a7936abd8b67.ap-south-1.playback.live-video.net/api/video/v1/ap-south-1.281851731848.channel.EPjg42C0o1hv.m3u8"; %>
-
-  <select class="form-control" id="languages" name="language-select">
-    <option value="<%= originalUrl %>">Original Stream</option>
-    <option value="<%= hindiUrl %>">Hindi / हिन्दी</option>
-    <option value="<%= banglaUrl %>">Bangla / বাংলা</option>
-    <option value="<%= tamilUrl %>">Tamil / தமிழ்</option>
-  </select>
-
-<hr>
-
-<video-player>
-  <video-skin>
-    <video height="50%" width="50%" id="video-player" autoplay controls slot="media" src="<%= originalUrl %>" playsinline></video>
-  </video-skin>
-</video-player>
+<body class="bg-surface text-on-surface min-h-screen selection:bg-primary selection:text-on-primary overflow-hidden flex flex-col">
+<!-- Script Ghosts -->
+<div class="script-ghost top-10 -left-10">अ</div>
+<div class="script-ghost bottom-10 -right-10">క</div>
+<div class="script-ghost top-1/2 left-1/4">म</div>
+<!-- TopNavBar -->
+<header class="w-full z-50 bg-white/80 backdrop-blur-xl border-b border-neutral-100 flex-none">
+<nav class="flex justify-between items-center px-8 h-16 max-w-[1920px] mx-auto">
+<div class="flex items-center gap-12">
+<span class="text-xl font-black tracking-tighter text-neutral-950 uppercase font-headline">
+                LiveLingo
+            </span>
 
 </div>
 
-<script>
+</nav>
+</header>
+<!-- Main SPA Body -->
+<main class="flex-1 flex flex-col lg:flex-row h-full max-w-[1920px] mx-auto w-full overflow-hidden">
+<!-- Left Column: Primary Video & Controls -->
+<section class="flex-1 flex flex-col p-6 lg:p-8 space-y-6 overflow-y-auto no-scrollbar">
+<!-- Header Section -->
+<div class="flex items-end justify-between">
+<div class="space-y-1">
+<div class="flex items-center gap-3">
+<span class="bg-error text-white px-2 py-0.5 rounded-sm text-[10px] font-bold tracking-widest uppercase">Live</span>
+<h1 class="text-2xl font-extrabold tracking-tighter font-headline text-primary">Global Tech Summit: Keynote</h1>
+</div>
+<p class="text-on-surface-variant text-sm font-body">Bangalore Digital Hub • 14.2k active listeners</p>
+</div>
+<div class="flex gap-2">
+<button class="flex items-center gap-2 px-4 py-2 border border-outline-variant hover:bg-neutral-50 transition-colors rounded text-sm font-bold">
+<span class="material-symbols-outlined text-sm">share</span> Share
+                </button>
+<button class="flex items-center gap-2 px-4 py-2 bg-primary text-white hover:bg-neutral-800 transition-colors rounded text-sm font-bold">
+<span class="material-symbols-outlined text-sm">record_voice_over</span> AI Cast
+                </button>
+</div>
+</div>
+<!-- Central Player -->
+<div class="relative aspect-video bg-black rounded-xl overflow-hidden shadow-2xl group ring-1 ring-black/5">
+<!--
+  The PlayerProvider passes state between the UI components
+  and Media, and makes fully custom UIs possible.
+  It does not have layout by default (display:contents)
+ -->
+<video-player>
+  <!--
+    Skins contain the entire player UI and are easily swappable.
+    They can each be "ejected" for full control and customization
+    of UI components.
+   -->
+  <video-minimal-skin>
+    <!--
+      Media are players without UIs, handling networking
+      and display of the media. They are easily swappable
+      to handle different sources.
+    -->
+    <video src="/videoplayback.mp4" playsinline></video>
+  </video-minimal-skin>
+</video-player><!-- Video Overlay UI -->
 
-const dropdown = document.getElementById('languages');
-const videoPlayer = document.getElementById('video-player');
-
-
-dropdown.addEventListener('change', (event) => {
-  const selectedValue = event.target.value;
-  videoPlayer.src = selectedValue;
-  videoPlayer.load();
-  videoPlayer.play().catch((err) => {
-    console.warn('Autoplay blocked or playback failed:', err);
-  });
-
-
-});
-
-
-</script>
-
-
-</body>
-</html>
+</div>
+<!-- Stream Selection (SPA Controls) -->
+<div class="space-y-4">
+<div class="flex items-center justify-between border-b border-neutral-100 pb-2">
+<h3 class="text-xs font-black uppercase tracking-widest text-primary">Stream Selection</h3>
+<span class="text-[10px] text-on-surface-variant font-bold">Switching audio &amp; transcript in real-time</span>
+</div>
+<div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+<!-- Original -->
+<button class="flex flex-col gap-1 p-4 border-2 border-primary bg-white text-left transition-all">
+<span class="text-[10px] font-black uppercase tracking-tighter text-primary">Original</span>
+<span class="text-lg font-headline font-bold">English</span>
+</button>
+<!-- Hindi (Selected State) -->
+<button class="flex flex-col gap-1 p-4 border border-outline-variant hover:border-primary bg-surface-container-low text-left transition-all">
+<span class="text-[10px] font-bold uppercase tracking-tighter text-on-surface-variant">AI Voice 01</span>
+<span class="text-lg font-headline font-bold">Hindi</span>
+</button>
+<!-- Bangla -->
+<button class="flex flex-col gap-1 p-4 border border-outline-variant hover:border-primary bg-surface-container-low text-left transition-all">
+<span class="text-[10px] font-bold uppercase tracking-tighter text-on-surface-variant">AI Voice 02</span>
+<span class="text-lg font-headline font-bold">Bangla</span>
+</button>
+<!-- Tamil -->
+<button class="flex flex-col gap-1 p-4 border border-outline-variant hover:border-primary bg-surface-container-low text-left transition-all">
+<span class="text-[10px] font-bold uppercase tracking-tighter text-on-surface-variant">AI Voice 03</span>
+<span class="text-lg font-headline font-bold">Tamil</span>
+</button>
+</div>
+</div>
+</section>
+<!-- Right Column: Contextual Sidebar (Transcript/Captions) -->
+<aside class="w-full lg:w-[400px] border-l border-neutral-100 bg-white flex flex-col flex-none">
+<div class="h-16 px-6 border-b border-neutral-100 flex items-center justify-between flex-none">
+<div class="flex items-center gap-2">
+<span class="material-symbols-outlined text-primary text-xl">description</span>
+<span class="font-headline font-bold text-sm">Real-time Transcript</span>
+</div>
+<div class="flex gap-2">
+<button class="p-1 hover:bg-neutral-50 rounded"><span class="material-symbols-outlined text-lg">download</span></button>
+<button class="p-1 hover:bg-neutral-50 rounded"><span class="material-symbols-outlined text-lg">more_vert</span></button>
+</div>
+</div>
+<!-- Transcript Content -->
+<div class="flex-1 overflow-y-auto p-6 space-y-6 no-scrollbar">
+<!-- Chunk 1 -->
+<div class="space-y-3">
+<div class="flex items-center justify-between">
+<span class="text-[10px] font-bold text-outline uppercase tracking-tighter">00:42:01 • ENG</span>
+<span class="text-[10px] font-bold text-primary uppercase tracking-tighter">Hindi Active</span>
+</div>
+<div class="space-y-3">
+<p class="text-xs text-on-surface-variant leading-relaxed italic border-l-2 border-neutral-100 pl-3">
+                        "The potential for AI to bridge cultural gaps in the next decade is unprecedented."
+                    </p>
+<div class="bg-surface-container-low p-4 border-l-4 border-primary">
+<p class="text-sm font-medium text-on-surface leading-relaxed">
+                            "अगले दशक में सांस्कृतिक दूरियों को पाटने के लिए एआई की क्षमता अभूतपूर्व है।"
+                        </p>
+</div>
+</div>
+</div>
+<!-- Chunk 2 -->
+<div class="space-y-3">
+<div class="flex items-center justify-between">
+<span class="text-[10px] font-bold text-outline uppercase tracking-tighter">00:42:08 • ENG</span>
+</div>
+<div class="space-y-3">
+<p class="text-xs text-on-surface-variant leading-relaxed italic border-l-2 border-neutral-100 pl-3">
+                        "We are focusing on modular architectures that prioritize local dialect accuracy."
+                    </p>
+<div class="bg-surface-container-low p-4">
+<p class="text-sm font-medium text-on-surface leading-relaxed">
+                            "हम मॉड्यूलर आर्किटेक्चर पर ध्यान केंद्रित कर रहे हैं जो स्थानीय बोली की सटीकता को प्राथमिकता देते हैं।"
+                        </p>
+</div>
+</div>
+</div>
+<!-- Active Processing -->
+<div class="space-y-3 opacity-60">
+<div class="flex items-center justify-between">
+<span class="text-[10px] font-bold text-outline uppercase tracking-tighter">00:42:14 • Processing</span>
+<div class="flex gap-1">
+<span class="w-1 h-1 bg-primary rounded-full animate-bounce"></span>
+<span class="w-1 h-1 bg-primary rounded-full animate-bounce [animation-delay:0.2s]"></span>
+<span class="w-1 h-1 bg-primary rounded-full animate-bounce [animation-delay:0.4s]"></span>
+</div>
+</div>
+<p class="text-xs text-on-surface-variant leading-relaxed italic border-l-2 border-neutral-100 pl-3">
+                    "Integrating these systems into the daily workflow of billion users..."
+                </p>
+<div class="bg-surface-container-low p-4 border border-dashed border-outline-variant">
+<div class="h-3 w-3/4 bg-neutral-200 rounded animate-pulse"></div>
+</div>
+</div>
+</div>
+<!-- Sidebar Footer Actions -->
+<div class="p-6 border-t border-neutral-100 bg-white space-y-3 flex-none">
+<div class="flex gap-2">
+<button class="flex-1 py-3 bg-neutral-900 text-white text-[10px] font-black uppercase tracking-widest hover:bg-black transition-colors">
+                    Export Session
+                </button>
+<button class="flex-1 py-3 border border-neutral-200 text-neutral-900 text-[10px] font-black uppercase tracking-widest hover:bg-neutral-50 transition-colors">
+                    Search Text
+                </button>
+</div>
+<p class="text-[9px] text-center text-neutral-400 font-bold uppercase tracking-widest">
+                System Latency: 42ms • Precision: 98.4%
+            </p>
+</div>
+</aside>
+</main>
+<footer class="w-full h-10 px-8 bg-white border-t border-neutral-100 flex items-center justify-between flex-none">
+<div class="flex items-center gap-4">
+<span class="text-[10px] font-black uppercase tracking-widest text-neutral-400">© 2024 LiveLingo</span>
+</div>
+<div class="flex gap-6">
+<a class="text-[10px] font-bold text-neutral-400 hover:text-black uppercase tracking-widest" href="#">API Status</a>
+<a class="text-[10px] font-bold text-neutral-400 hover:text-black uppercase tracking-widest" href="#">Support</a>
+</div>
+</footer>
+</body></html>
