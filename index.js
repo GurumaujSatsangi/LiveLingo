@@ -2,6 +2,7 @@ import express from "express";
 import dotenv from "dotenv";
 import { spawn } from "child_process";
 import ffmpegPath from "ffmpeg-static";
+import ivsSdk from "@aws-sdk/client-ivs";
 import { ElevenLabsClient } from "@elevenlabs/elevenlabs-js";
 import fs from "fs";
 import path from "path";
@@ -11,6 +12,7 @@ import IVSTranslatorStreamer from "./ivsTranslatorStreamer.js";
 import StreamSessionManager from "./StreamSessionManager.js";
 
 const { WaveFile } = wavefilePkg;
+const { IvsClient, GetStreamCommand } = ivsSdk;
 
 dotenv.config();
 
@@ -104,11 +106,129 @@ const PLAYBACK_BASE_URL = normalizePlaybackBaseUrl(
 const PLAYBACK_CHANNEL_PATHS = {
   original: "/api/video/v1/ap-south-1.281851731848.channel.UqVC4zjntu05.m3u8",
   hindi: "/api/video/v1/ap-south-1.281851731848.channel.dAAx194gnHFl.m3u8",
+  bangla: process.env.PLAYBACK_CHANNEL_PATH_BANGLA || "",
+  tamil: process.env.PLAYBACK_CHANNEL_PATH_TAMIL || "",
 };
 
+const IVS_REGION = process.env.AWS_REGION || process.env.AWS_IVS_REGION || "ap-south-1";
+const IVS_CHANNEL_ARNS = {
+  original: process.env.AWS_IVS_CHANNEL_ARN_ORIGINAL || process.env.AWS_IVS_CHANNEL_ARN || "",
+  hindi: process.env.AWS_IVS_CHANNEL_ARN_HINDI || "",
+  bangla: process.env.AWS_IVS_CHANNEL_ARN_BANGLA || "",
+  tamil: process.env.AWS_IVS_CHANNEL_ARN_TAMIL || "",
+};
+const LOCATION_LOOKUP_TIMEOUT_MS = Number(process.env.LOCATION_LOOKUP_TIMEOUT_MS || 2000);
+const IP_GEO_ENDPOINT = process.env.IP_GEO_ENDPOINT || "https://ipapi.co";
+
+const ivsClient = new IvsClient({ region: IVS_REGION });
+
 function buildPlaybackUrl(channelPath) {
+  if (!channelPath) {
+    return null;
+  }
+
   const normalizedPath = channelPath.startsWith("/") ? channelPath : `/${channelPath}`;
   return `${PLAYBACK_BASE_URL}${normalizedPath}`;
+}
+
+function formatViewerCount(viewerCount) {
+  if (!Number.isFinite(viewerCount) || viewerCount < 0) {
+    return "--";
+  }
+
+  if (viewerCount < 1000) {
+    return String(viewerCount);
+  }
+
+  const compact = Intl.NumberFormat("en", {
+    notation: "compact",
+    maximumFractionDigits: 1,
+  }).format(viewerCount);
+  return compact.toLowerCase();
+}
+
+function getClientIp(req) {
+  const forwarded = String(req.headers["x-forwarded-for"] || "").trim();
+  if (forwarded) {
+    return forwarded.split(",")[0].trim();
+  }
+
+  const rawIp = req.socket?.remoteAddress || req.ip || "";
+  return rawIp.replace(/^::ffff:/, "");
+}
+
+function isPrivateOrLocalIp(ipAddress) {
+  if (!ipAddress) return true;
+  return (
+    ipAddress === "::1" ||
+    ipAddress === "127.0.0.1" ||
+    ipAddress.startsWith("10.") ||
+    ipAddress.startsWith("192.168.") ||
+    /^172\.(1[6-9]|2\d|3[0-1])\./.test(ipAddress)
+  );
+}
+
+async function fetchLocationForRequest(req) {
+  const ipAddress = getClientIp(req);
+
+  if (isPrivateOrLocalIp(ipAddress)) {
+    return "Unknown Location";
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), LOCATION_LOOKUP_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(`${IP_GEO_ENDPOINT}/${encodeURIComponent(ipAddress)}/json/`, {
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      return "Unknown Location";
+    }
+
+    const payload = await response.json();
+    const city = String(payload.city || "").trim();
+    const region = String(payload.region || payload.region_code || "").trim();
+    const country = String(payload.country_name || payload.country || "").trim();
+    const parts = [city, region, country].filter(Boolean);
+
+    return parts.length ? parts.join(", ") : "Unknown Location";
+  } catch (err) {
+    return "Unknown Location";
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchLiveViewerCount(language) {
+  const requestedLanguage = String(language || "original").toLowerCase();
+  const channelArn = IVS_CHANNEL_ARNS[requestedLanguage];
+
+  if (!channelArn) {
+    return null;
+  }
+
+  try {
+    const response = await ivsClient.send(new GetStreamCommand({ channelArn }));
+    const viewerCount = response?.stream?.viewerCount;
+
+    if (!Number.isFinite(viewerCount)) {
+      return 0;
+    }
+
+    return viewerCount;
+  } catch (err) {
+    const isOffline =
+      err?.name === "ResourceNotFoundException" ||
+      err?.$metadata?.httpStatusCode === 404;
+
+    if (!isOffline) {
+      console.warn(`⚠️  Unable to fetch IVS viewers for ${requestedLanguage}: ${err.message}`);
+    }
+
+    return 0;
+  }
 }
 
 function getActiveChunkDurationSec() {
@@ -1782,15 +1902,45 @@ async function startAudioSegmentation() {
 // EXPRESS SERVER
 // ============================================
 
-app.get("/", (req, res) => {
+app.get("/", async (req, res) => {
+  const streamUrls = {
+    original: buildPlaybackUrl(PLAYBACK_CHANNEL_PATHS.original),
+    hindi: buildPlaybackUrl(PLAYBACK_CHANNEL_PATHS.hindi),
+    bangla: buildPlaybackUrl(PLAYBACK_CHANNEL_PATHS.bangla),
+    tamil: buildPlaybackUrl(PLAYBACK_CHANNEL_PATHS.tamil),
+  };
+
+  const initialLanguage = "original";
+
+  const [viewerLocation, liveViewerCount] = await Promise.all([
+    fetchLocationForRequest(req),
+    fetchLiveViewerCount(initialLanguage),
+  ]);
+
   res.render("home.ejs", {
-    streamUrls: {
-      original: buildPlaybackUrl(PLAYBACK_CHANNEL_PATHS.original),
-      hindi: buildPlaybackUrl(PLAYBACK_CHANNEL_PATHS.hindi),
-      bangla: null,
-      tamil: null,
-    },
+    streamUrls,
     playbackBaseUrl: PLAYBACK_BASE_URL,
+    viewerLocation,
+    initialLanguage,
+    initialLiveViewerCount: Number.isFinite(liveViewerCount) ? liveViewerCount : 0,
+    initialLiveViewerCountLabel: formatViewerCount(Number.isFinite(liveViewerCount) ? liveViewerCount : 0),
+  });
+});
+
+app.get("/api/ivs/live-viewers", async (req, res) => {
+  const language = String(req.query.language || "original").toLowerCase();
+  const supportedLanguages = new Set(["original", "hindi", "bangla", "tamil"]);
+
+  if (!supportedLanguages.has(language)) {
+    return res.status(400).json({ error: "Unsupported language" });
+  }
+
+  const viewerCount = await fetchLiveViewerCount(language);
+
+  res.json({
+    language,
+    viewerCount,
+    viewerCountLabel: formatViewerCount(Number.isFinite(viewerCount) ? viewerCount : 0),
   });
 });
 
