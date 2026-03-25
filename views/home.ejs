@@ -92,14 +92,14 @@
         .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
     </style>
 </head>
-<body class="bg-surface text-on-surface min-h-screen selection:bg-primary selection:text-on-primary overflow-hidden flex flex-col">
+<body class="bg-surface text-on-surface min-h-screen selection:bg-primary selection:text-on-primary overflow-x-hidden overflow-y-auto flex flex-col">
 <!-- Script Ghosts -->
 <div class="script-ghost top-10 -left-10">अ</div>
 <div class="script-ghost bottom-10 -right-10">క</div>
 <div class="script-ghost top-1/2 left-1/4">म</div>
 <!-- TopNavBar -->
 <header class="w-full z-50 bg-white/80 backdrop-blur-xl border-b border-neutral-100 flex-none">
-<nav class="flex justify-between items-center px-8 h-16 max-w-[1920px] mx-auto">
+<nav class="flex justify-between items-center px-4 sm:px-6 lg:px-8 h-14 sm:h-16 max-w-[1440px] mx-auto">
 <div class="flex items-center gap-12">
 <span class="text-xl font-black tracking-tighter text-neutral-950 uppercase font-headline">
                 LiveLingo
@@ -110,26 +110,26 @@
 </nav>
 </header>
 <!-- Main SPA Body -->
-<main class="flex-1 flex flex-col lg:flex-row h-full max-w-[1920px] mx-auto w-full overflow-hidden">
+<main class="flex-1 flex flex-col lg:flex-row max-w-[1440px] mx-auto w-full overflow-visible">
 <!-- Left Column: Primary Video & Controls -->
-<section class="flex-1 flex flex-col p-6 lg:p-8 space-y-6 overflow-y-auto no-scrollbar">
+<section class="flex-1 flex flex-col p-4 sm:p-6 lg:p-8 space-y-5 sm:space-y-6 overflow-visible min-w-0">
 <!-- Header Section -->
-<div class="flex items-end justify-between">
+<div class="flex flex-col gap-4 sm:gap-3 sm:flex-row sm:items-end sm:justify-between">
 <div class="space-y-1">
 <div class="flex items-center gap-3">
 <span class="bg-error text-white px-2 py-0.5 rounded-sm text-[10px] font-bold tracking-widest uppercase">Live</span>
-<h1 class="text-2xl font-extrabold tracking-tighter font-headline text-primary">Global Tech Summit: Keynote</h1>
+<h1 class="text-xl sm:text-2xl font-extrabold tracking-tighter font-headline text-primary">Global Tech Summit: Keynote</h1>
 </div>
 <p class="text-on-surface-variant text-sm font-body">
 <span id="viewer-location"><%= viewerLocation %></span> •
 <span id="active-listeners-count"><%= initialLiveViewerCountLabel %></span> active listeners
 </p>
 </div>
-<div class="flex gap-2">
-<button class="flex items-center gap-2 px-4 py-2 border border-outline-variant hover:bg-neutral-50 transition-colors rounded text-sm font-bold">
+<div class="flex gap-2 w-full sm:w-auto">
+<button class="flex items-center justify-center gap-2 px-3 sm:px-4 py-2 border border-outline-variant hover:bg-neutral-50 transition-colors rounded text-xs sm:text-sm font-bold flex-1 sm:flex-none">
 <span class="material-symbols-outlined text-sm">share</span> Share
                 </button>
-<button class="flex items-center gap-2 px-4 py-2 bg-primary text-white hover:bg-neutral-800 transition-colors rounded text-sm font-bold">
+<button class="flex items-center justify-center gap-2 px-3 sm:px-4 py-2 bg-primary text-white hover:bg-neutral-800 transition-colors rounded text-xs sm:text-sm font-bold flex-1 sm:flex-none">
 <span class="material-symbols-outlined text-sm">record_voice_over</span> AI Cast
                 </button>
 </div>
@@ -165,40 +165,20 @@
 <span class="text-[10px] text-on-surface-variant font-bold">Switching audio &amp; transcript in real-time</span>
 </div>
 <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
-<!-- Original -->
+<% streamOptions.forEach((option) => { %>
 <button class="stream-option flex flex-col gap-1 p-4 border text-left transition-all hover:border-primary"
-data-language="original"
-data-stream-url="<%= streamUrls.original || '' %>">
-<span class="text-[10px] font-black uppercase tracking-tighter text-primary">Original</span>
-<span class="text-lg font-headline font-bold">English</span>
+data-language="<%= option.language %>"
+data-stream-url="<%= streamUrls[option.language] || '' %>">
+<span class="text-[10px] font-bold uppercase tracking-tighter text-on-surface-variant"><%= option.badge %></span>
+<span class="text-lg font-headline font-bold"><%= option.label %></span>
 </button>
-<!-- Hindi (Selected State) -->
-<button class="stream-option flex flex-col gap-1 p-4 border text-left transition-all hover:border-primary"
-data-language="hindi"
-data-stream-url="<%= streamUrls.hindi || '' %>">
-<span class="text-[10px] font-bold uppercase tracking-tighter text-on-surface-variant">AI Voice 01</span>
-<span class="text-lg font-headline font-bold">Hindi</span>
-</button>
-<!-- Bangla -->
-<button class="stream-option flex flex-col gap-1 p-4 border text-left transition-all hover:border-primary"
-data-language="bangla"
-data-stream-url="<%= streamUrls.bangla || '' %>">
-<span class="text-[10px] font-bold uppercase tracking-tighter text-on-surface-variant">AI Voice 02</span>
-<span class="text-lg font-headline font-bold">Bangla</span>
-</button>
-<!-- Tamil -->
-<button class="stream-option flex flex-col gap-1 p-4 border text-left transition-all hover:border-primary"
-data-language="tamil"
-data-stream-url="<%= streamUrls.tamil || '' %>">
-<span class="text-[10px] font-bold uppercase tracking-tighter text-on-surface-variant">AI Voice 03</span>
-<span class="text-lg font-headline font-bold">Tamil</span>
-</button>
+<% }); %>
 </div>
 </div>
 </section>
 <!-- Right Column: Contextual Sidebar (Transcript/Captions) -->
-<aside class="w-full lg:w-[400px] border-l border-neutral-100 bg-white flex flex-col flex-none">
-<div class="h-16 px-6 border-b border-neutral-100 flex items-center justify-between flex-none">
+<aside class="w-full lg:w-[340px] xl:w-[380px] border-l border-neutral-100 bg-white flex flex-col flex-none">
+<div class="h-14 sm:h-16 px-4 sm:px-6 border-b border-neutral-100 flex items-center justify-between flex-none">
 <div class="flex items-center gap-2">
 <span class="material-symbols-outlined text-primary text-xl">description</span>
 <span class="font-headline font-bold text-sm">Real-time Transcript</span>
@@ -209,7 +189,7 @@ data-stream-url="<%= streamUrls.tamil || '' %>">
 </div>
 </div>
 <!-- Transcript Content -->
-<div class="flex-1 overflow-y-auto p-6 space-y-6 no-scrollbar">
+<div class="flex-1 overflow-y-auto p-4 sm:p-6 space-y-6 no-scrollbar">
 <!-- Chunk 1 -->
 <div class="space-y-3">
 <div class="flex items-center justify-between">
@@ -262,7 +242,7 @@ data-stream-url="<%= streamUrls.tamil || '' %>">
 </div>
 </div>
 <!-- Sidebar Footer Actions -->
-<div class="p-6 border-t border-neutral-100 bg-white space-y-3 flex-none">
+<div class="p-4 sm:p-6 border-t border-neutral-100 bg-white space-y-3 flex-none">
 <div class="flex gap-2">
 <button class="flex-1 py-3 bg-neutral-900 text-white text-[10px] font-black uppercase tracking-widest hover:bg-black transition-colors">
                     Export Session
@@ -277,14 +257,11 @@ data-stream-url="<%= streamUrls.tamil || '' %>">
 </div>
 </aside>
 </main>
-<footer class="w-full h-10 px-8 bg-white border-t border-neutral-100 flex items-center justify-between flex-none">
+<footer class="w-full min-h-10 px-4 sm:px-8 py-2 bg-white border-t border-neutral-100 flex items-center justify-between flex-none">
 <div class="flex items-center gap-4">
-<span class="text-[10px] font-black uppercase tracking-widest text-neutral-400">© 2024 LiveLingo</span>
+<span class="text-[10px] font-black uppercase tracking-widest text-neutral-400">© LiveLingo</span>
 </div>
-<div class="flex gap-6">
-<a class="text-[10px] font-bold text-neutral-400 hover:text-black uppercase tracking-widest" href="#">API Status</a>
-<a class="text-[10px] font-bold text-neutral-400 hover:text-black uppercase tracking-widest" href="#">Support</a>
-</div>
+
 </footer>
 <script>
     (function () {
@@ -301,8 +278,18 @@ data-stream-url="<%= streamUrls.tamil || '' %>">
             button.classList.remove(...selectedClasses, ...unselectedClasses);
             if (isSelected) {
                 button.classList.add(...selectedClasses);
+                const badge = button.querySelector("span:first-child");
+                if (badge) {
+                    badge.classList.remove("text-on-surface-variant");
+                    badge.classList.add("text-primary", "font-black");
+                }
             } else {
                 button.classList.add(...unselectedClasses);
+                const badge = button.querySelector("span:first-child");
+                if (badge) {
+                    badge.classList.remove("text-primary", "font-black");
+                    badge.classList.add("text-on-surface-variant");
+                }
             }
         }
 

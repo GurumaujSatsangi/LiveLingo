@@ -1910,6 +1910,13 @@ app.get("/", async (req, res) => {
     tamil: buildPlaybackUrl(PLAYBACK_CHANNEL_PATHS.tamil),
   };
 
+  const streamOptions = [
+    { language: "original", label: "English", badge: "Original" },
+    { language: "hindi", label: "Hindi", badge: "AI Voice 01" },
+    { language: "bangla", label: "Bangla", badge: "AI Voice 02" },
+    { language: "tamil", label: "Tamil", badge: "AI Voice 03" },
+  ];
+
   const initialLanguage = "original";
 
   const [viewerLocation, liveViewerCount] = await Promise.all([
@@ -1919,6 +1926,7 @@ app.get("/", async (req, res) => {
 
   res.render("home.ejs", {
     streamUrls,
+    streamOptions,
     playbackBaseUrl: PLAYBACK_BASE_URL,
     viewerLocation,
     initialLanguage,
