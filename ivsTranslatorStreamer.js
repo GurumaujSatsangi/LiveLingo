@@ -51,7 +51,7 @@ class IVSTranslatorStreamer {
       options.backgroundMusicPath ||
       process.env.BGMUSIC_FILE_PATH ||
       process.env.BG_MUSIC_FILE_PATH ||
-      "sample/bgmusic.mp3";
+      "public/bgmusic.mp3";
     this.backgroundMusicVolume = Math.max(
       0,
       Math.min(1, Number(options.backgroundMusicVolume ?? process.env.BGMUSIC_VOLUME ?? 0.08))
@@ -428,7 +428,11 @@ class IVSTranslatorStreamer {
       return;
     }
 
-    const frame = this.getNextFrame();
+    const translatedFrame = this.getNextTranslatedFrame();
+    const backgroundFrame = this.getBackgroundFrame();
+    const frame = translatedFrame
+      ? this.mixPcmFrames(translatedFrame, backgroundFrame)
+      : backgroundFrame;
     const writeSuccess = this.ffmpeg.stdin.write(frame);
 
     if (!writeSuccess) {
@@ -439,7 +443,7 @@ class IVSTranslatorStreamer {
     }
   }
 
-  getNextFrame() {
+  getNextTranslatedFrame() {
     // Load next in-order chunk when available.
     if (!this.currentChunk) {
       const nextBuffer = this.pendingChunks.get(this.nextSequenceToPlay);
@@ -457,7 +461,7 @@ class IVSTranslatorStreamer {
     }
 
     if (!this.currentChunk) {
-      return this.getFallbackFrame();
+      return null;
     }
 
     const chunk = this.currentChunk;
@@ -472,13 +476,32 @@ class IVSTranslatorStreamer {
         return tail;
       }
 
-      const filler = this.getFallbackFrame();
-      return Buffer.concat([tail, filler.slice(0, this.frameBytes - tail.length)]);
+      return Buffer.concat([tail, Buffer.alloc(this.frameBytes - tail.length)]);
     }
 
     const frame = chunk.buffer.slice(chunk.offset, chunk.offset + this.frameBytes);
     chunk.offset += this.frameBytes;
     return frame;
+  }
+
+  mixPcmFrames(primaryFrame, backgroundFrame) {
+    if (!backgroundFrame || backgroundFrame.length === 0) {
+      return primaryFrame;
+    }
+
+    const mixed = Buffer.alloc(this.frameBytes);
+    for (let offset = 0; offset < this.frameBytes; offset += 2) {
+      const primarySample = primaryFrame.readInt16LE(offset);
+      const backgroundSample = backgroundFrame.readInt16LE(offset);
+      let value = primarySample + backgroundSample;
+
+      if (value > 32767) value = 32767;
+      if (value < -32768) value = -32768;
+
+      mixed.writeInt16LE(value, offset);
+    }
+
+    return mixed;
   }
 
   handlePotentialMissingSequence() {
@@ -505,7 +528,7 @@ class IVSTranslatorStreamer {
     }
   }
 
-  getFallbackFrame() {
+  getBackgroundFrame() {
     if (!this.fallbackPcmBuffer || this.fallbackPcmBuffer.length === 0) {
       return Buffer.alloc(this.frameBytes);
     }

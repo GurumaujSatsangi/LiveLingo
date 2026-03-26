@@ -65,6 +65,10 @@ const REALTIME_PIPELINE_BASE_URL = String(process.env.REALTIME_PIPELINE_BASE_URL
   ""
 );
 const REALTIME_PIPELINE_OUTPUT_SECRET = process.env.REALTIME_PIPELINE_OUTPUT_SECRET || "";
+const REALTIME_CAPTURE_CHUNK_DURATION_SEC = Number(
+  process.env.REALTIME_CAPTURE_CHUNK_DURATION_SEC || TARGET_CHUNK_DURATION_SEC
+);
+const PCM_BYTES_PER_SECOND = PCM_SAMPLE_RATE * PCM_BYTES_PER_SAMPLE;
 let restartAttempts = 0;
 let lastRestartTime = 0;
 
@@ -108,9 +112,31 @@ const PLAYBACK_BASE_URL = normalizePlaybackBaseUrl(
   process.env.CLOUDFRONT_PLAYBACK_BASE_URL || process.env.PLAYBACK_BASE_URL || DEFAULT_PLAYBACK_BASE_URL
 );
 
+function getPlaybackPathFromChannelArn(channelArn) {
+  const arn = String(channelArn || "").trim();
+  if (!arn) {
+    return "";
+  }
+
+  const match = arn.match(/^arn:aws:ivs:([a-z0-9-]+):(\d+):channel\/([A-Za-z0-9_-]+)$/i);
+  if (!match) {
+    return "";
+  }
+
+  const [, region, accountId, channelId] = match;
+  return `/api/video/v1/${region}.${accountId}.channel.${channelId}.m3u8`;
+}
+
 const LEGACY_PLAYBACK_CHANNEL_PATHS = {
   original: "/api/video/v1/ap-south-1.281851731848.channel.UqVC4zjntu05.m3u8",
   hindi: "/api/video/v1/ap-south-1.281851731848.channel.dAAx194gnHFl.m3u8",
+};
+
+const ARN_DERIVED_PLAYBACK_CHANNEL_PATHS = {
+  original: getPlaybackPathFromChannelArn(process.env.AWS_IVS_CHANNEL_ARN_ORIGINAL || process.env.AWS_IVS_CHANNEL_ARN),
+  hindi: getPlaybackPathFromChannelArn(process.env.AWS_IVS_CHANNEL_ARN_HINDI),
+  bangla: getPlaybackPathFromChannelArn(process.env.AWS_IVS_CHANNEL_ARN_BANGLA),
+  tamil: getPlaybackPathFromChannelArn(process.env.AWS_IVS_CHANNEL_ARN_TAMIL),
 };
 
 const PLAYBACK_CHANNEL_PATHS = {
@@ -119,13 +145,29 @@ const PLAYBACK_CHANNEL_PATHS = {
     process.env.AWS_IVS_PLAYBACK_URL_ORIGINAL ||
     process.env.AWS_IVS_PLAYBACK_URL ||
     process.env.LIVESTREAM_HLS_URL ||
+    ARN_DERIVED_PLAYBACK_CHANNEL_PATHS.original ||
     LEGACY_PLAYBACK_CHANNEL_PATHS.original,
   hindi:
     process.env.PLAYBACK_CHANNEL_PATH_HINDI ||
     process.env.AWS_IVS_PLAYBACK_URL_HINDI ||
+    ARN_DERIVED_PLAYBACK_CHANNEL_PATHS.hindi ||
+    process.env.AWS_IVS_PLAYBACK_URL ||
+    process.env.LIVESTREAM_HLS_URL ||
     LEGACY_PLAYBACK_CHANNEL_PATHS.hindi,
-  bangla: process.env.PLAYBACK_CHANNEL_PATH_BANGLA || "",
-  tamil: process.env.PLAYBACK_CHANNEL_PATH_TAMIL || "",
+  bangla:
+    process.env.PLAYBACK_CHANNEL_PATH_BANGLA ||
+    process.env.AWS_IVS_PLAYBACK_URL_BANGLA ||
+    ARN_DERIVED_PLAYBACK_CHANNEL_PATHS.bangla ||
+    process.env.AWS_IVS_PLAYBACK_URL ||
+    process.env.LIVESTREAM_HLS_URL ||
+    "",
+  tamil:
+    process.env.PLAYBACK_CHANNEL_PATH_TAMIL ||
+    process.env.AWS_IVS_PLAYBACK_URL_TAMIL ||
+    ARN_DERIVED_PLAYBACK_CHANNEL_PATHS.tamil ||
+    process.env.AWS_IVS_PLAYBACK_URL ||
+    process.env.LIVESTREAM_HLS_URL ||
+    "",
 };
 
 const WEBRTC_WHEP_URLS = {
@@ -134,6 +176,8 @@ const WEBRTC_WHEP_URLS = {
   bangla: String(process.env.WEBRTC_WHEP_URL_BANGLA || "").trim(),
   tamil: String(process.env.WEBRTC_WHEP_URL_TAMIL || "").trim(),
 };
+const USE_WEBRTC_TRANSLATED_AUDIO =
+  String(process.env.USE_WEBRTC_TRANSLATED_AUDIO || "false").toLowerCase() === "true";
 
 const IVS_REGION = process.env.AWS_REGION || process.env.AWS_IVS_REGION || "ap-south-1";
 const IVS_CHANNEL_ARNS = {
@@ -438,6 +482,208 @@ if (!fs.existsSync(SAMPLE_FOLDER)) {
 
 let ffmpeg;
 let isFFmpegRunning = false;
+let realtimeCaptureFfmpeg;
+let realtimeCaptureBuffer = Buffer.alloc(0);
+let nextRealtimeCaptureSequence = 1;
+let isRealtimeCaptureFlushRunning = false;
+let shouldStopRealtimeCapture = false;
+
+async function processRealtimeCaptureBuffer() {
+  if (isRealtimeCaptureFlushRunning) {
+    return;
+  }
+
+  isRealtimeCaptureFlushRunning = true;
+  const chunkDurationSec =
+    Number.isFinite(REALTIME_CAPTURE_CHUNK_DURATION_SEC) && REALTIME_CAPTURE_CHUNK_DURATION_SEC > 0
+      ? REALTIME_CAPTURE_CHUNK_DURATION_SEC
+      : getActiveChunkDurationSec();
+  const chunkBytes = Math.max(PCM_FRAME_BYTES, Math.round(chunkDurationSec * PCM_BYTES_PER_SECOND));
+
+  try {
+    while (realtimeCaptureBuffer.length >= chunkBytes) {
+      const chunkPcmBuffer = realtimeCaptureBuffer.subarray(0, chunkBytes);
+      realtimeCaptureBuffer = realtimeCaptureBuffer.subarray(chunkBytes);
+
+      const sequenceNumber = nextRealtimeCaptureSequence++;
+      await forwardPcmChunkToRealtimePipeline(chunkPcmBuffer, sequenceNumber, chunkDurationSec);
+      sessionManager.incrementChunkCount(sessionManager.getCurrentSession().sessionId, "source");
+    }
+  } catch (err) {
+    console.error(`❌ Realtime in-memory forwarding failed: ${err.message}`);
+  } finally {
+    isRealtimeCaptureFlushRunning = false;
+
+    // If new data arrived while flushing, process again.
+    if (realtimeCaptureBuffer.length >= chunkBytes) {
+      void processRealtimeCaptureBuffer();
+    }
+  }
+}
+
+async function stopRealtimeAudioCapture() {
+  shouldStopRealtimeCapture = true;
+  isFFmpegRunning = false;
+
+  if (realtimeCaptureFfmpeg && !realtimeCaptureFfmpeg.killed) {
+    await new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        try {
+          realtimeCaptureFfmpeg.kill("SIGKILL");
+        } catch {
+          // Best effort kill.
+        }
+        resolve();
+      }, 4000);
+
+      realtimeCaptureFfmpeg.once("close", () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+
+      try {
+        realtimeCaptureFfmpeg.kill("SIGTERM");
+      } catch {
+        clearTimeout(timeout);
+        resolve();
+      }
+    });
+  }
+
+  realtimeCaptureFfmpeg = null;
+  realtimeCaptureBuffer = Buffer.alloc(0);
+  isRealtimeCaptureFlushRunning = false;
+}
+
+async function startRealtimeAudioCapture() {
+  if (!USE_EXTERNAL_REALTIME_PIPELINE) {
+    return;
+  }
+
+  if (realtimeCaptureFfmpeg && !realtimeCaptureFfmpeg.killed) {
+    console.log("⏳ Realtime audio capture already running");
+    return;
+  }
+
+  const streamURL = getStreamURL();
+  if (!streamURL) {
+    console.error("❌ Realtime audio capture requires AWS_IVS_PLAYBACK_URL or LIVESTREAM_HLS_URL");
+    return;
+  }
+
+  if (!REALTIME_PIPELINE_BASE_URL) {
+    console.error("❌ REALTIME_PIPELINE_BASE_URL is required for in-memory realtime capture");
+    return;
+  }
+
+  shouldStopRealtimeCapture = false;
+  console.log("🎧 Starting in-memory realtime audio capture (no disk chunks)...");
+
+  const isAccessible = await validateStreamURL(streamURL);
+  if (!isAccessible) {
+    restartAttempts++;
+    const delay = getBackoffDelay();
+
+    if (restartAttempts > MAX_RESTART_RETRIES) {
+      console.error(`❌ Max restart attempts (${MAX_RESTART_RETRIES}) exceeded for realtime audio capture`);
+      return;
+    }
+
+    setTimeout(() => {
+      if (!shouldStopRealtimeCapture) {
+        void startRealtimeAudioCapture();
+      }
+    }, delay);
+    return;
+  }
+
+  realtimeCaptureBuffer = Buffer.alloc(0);
+  const ffmpegArgs = [
+    "-loglevel",
+    "warning",
+    "-live_start_index",
+    "-1",
+    "-fflags",
+    "+nobuffer+fastseek",
+    "-flags",
+    "low_delay",
+    "-protocol_whitelist",
+    "file,http,https,tcp,tls,crypto,data",
+    "-http_persistent",
+    "1",
+    "-http_multiple",
+    "1",
+    "-reconnect",
+    "1",
+    "-reconnect_streamed",
+    "1",
+    "-reconnect_on_network_error",
+    "1",
+    "-reconnect_delay_max",
+    "2",
+    "-i",
+    streamURL,
+    "-map",
+    "0:a:0",
+    "-acodec",
+    "pcm_s16le",
+    "-ar",
+    String(PCM_SAMPLE_RATE),
+    "-ac",
+    "1",
+    "-f",
+    "s16le",
+    "pipe:1",
+  ];
+
+  realtimeCaptureFfmpeg = spawn(ffmpegPath, ffmpegArgs, {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  realtimeCaptureFfmpeg.stdout.on("data", (data) => {
+    if (!Buffer.isBuffer(data) || data.length === 0) {
+      return;
+    }
+
+    realtimeCaptureBuffer = Buffer.concat([realtimeCaptureBuffer, data]);
+    void processRealtimeCaptureBuffer();
+  });
+
+  realtimeCaptureFfmpeg.stderr.on("data", (data) => {
+    const message = data.toString().trim();
+    if (message && !message.includes("frame=") && !message.includes("Last message repeated")) {
+      console.log(`🔊 Realtime capture FFmpeg: ${message}`);
+    }
+  });
+
+  realtimeCaptureFfmpeg.on("error", (err) => {
+    console.error(`❌ Realtime capture FFmpeg error: ${err.message}`);
+  });
+
+  realtimeCaptureFfmpeg.on("close", () => {
+    realtimeCaptureFfmpeg = null;
+    isFFmpegRunning = false;
+
+    if (shouldStopRealtimeCapture) {
+      return;
+    }
+
+    restartAttempts++;
+    const delay = getBackoffDelay();
+    if (restartAttempts <= MAX_RESTART_RETRIES) {
+      setTimeout(() => {
+        if (!shouldStopRealtimeCapture) {
+          void startRealtimeAudioCapture();
+        }
+      }, delay);
+    } else {
+      console.error(`❌ Max restart attempts (${MAX_RESTART_RETRIES}) exceeded for realtime audio capture`);
+    }
+  });
+
+  isFFmpegRunning = true;
+  restartAttempts = 0;
+}
 
 function normalizeText(value) {
   if (typeof value === "string") return value;
@@ -1233,9 +1479,25 @@ async function forwardChunkToRealtimePipeline(chunkPath, sequenceNumber) {
     throw new Error(`Cannot forward empty chunk: ${path.basename(chunkPath)}`);
   }
 
-  const durationSec = Math.max(0.05, getWavDurationSeconds(chunkPath));
+  await forwardPcmChunkToRealtimePipeline(
+    chunkBuffer,
+    sequenceNumber,
+    Math.max(0.05, getWavDurationSeconds(chunkPath))
+  );
+}
+
+async function forwardPcmChunkToRealtimePipeline(chunkBuffer, sequenceNumber, durationSec) {
+  if (!USE_EXTERNAL_REALTIME_PIPELINE) {
+    return;
+  }
+
+  if (!chunkBuffer || !chunkBuffer.length) {
+    throw new Error(`Cannot forward empty PCM chunk for seq ${sequenceNumber}`);
+  }
+
+  const safeDurationSec = Math.max(0.05, Number(durationSec) || chunkBuffer.length / PCM_BYTES_PER_SECOND);
   const startTime = realtimePipelineTimelineSec;
-  const endTime = startTime + durationSec;
+  const endTime = startTime + safeDurationSec;
   realtimePipelineTimelineSec = endTime;
 
   const response = await fetch(`${REALTIME_PIPELINE_BASE_URL}/chunk`, {
@@ -1646,10 +1908,8 @@ async function processChunkQueue() {
 
 function startChunkScanner() {
   if (USE_EXTERNAL_REALTIME_PIPELINE) {
-    if (!REALTIME_PIPELINE_BASE_URL) {
-      console.warn("⚠️  REALTIME_PIPELINE_BASE_URL is missing. External realtime pipeline bridge is disabled.");
-      return;
-    }
+    console.log("🧠 External realtime pipeline uses in-memory capture; chunk scanner skipped.");
+    return;
   }
 
   if (!USE_DIRECT_ELEVENLABS_DUBBING && !sarvamClient) {
@@ -1763,6 +2023,11 @@ function getStreamURL() {
  * Includes authentication headers and proper error handling
  */
 async function startAudioSegmentation() {
+  if (USE_EXTERNAL_REALTIME_PIPELINE) {
+    await startRealtimeAudioCapture();
+    return;
+  }
+
   // Check if already running
   if (isFFmpegRunning) {
     console.log("⏳ FFmpeg already running, skipping restart");
@@ -1978,6 +2243,7 @@ app.get("/", async (req, res) => {
   res.render("home.ejs", {
     streamUrls,
     webrtcWhepUrls: WEBRTC_WHEP_URLS,
+    useWebrtcTranslatedAudio: USE_WEBRTC_TRANSLATED_AUDIO,
     streamOptions,
     playbackBaseUrl: PLAYBACK_BASE_URL,
     viewerLocation,
@@ -2197,6 +2463,12 @@ app.post("/stream/stop", (req, res) => {
   if (!isFFmpegRunning) {
     return res.json({ message: "Stream not running" });
   }
+
+  if (USE_EXTERNAL_REALTIME_PIPELINE) {
+    stopRealtimeAudioCapture();
+    return res.json({ message: "Realtime in-memory audio bridge stopped" });
+  }
+
   if (ffmpeg && !ffmpeg.killed) {
     ffmpeg.kill("SIGTERM");
     isFFmpegRunning = false;
@@ -2257,6 +2529,9 @@ httpServer.listen(PORT, async () => {
 // Graceful shutdown
 process.on("SIGINT", async () => {
   console.log("\n🛑 Shutting down gracefully...");
+  if (USE_EXTERNAL_REALTIME_PIPELINE) {
+    await stopRealtimeAudioCapture();
+  }
   if (chunkScannerTimer) {
     clearInterval(chunkScannerTimer);
   }

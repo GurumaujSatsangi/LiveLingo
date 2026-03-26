@@ -205,6 +205,7 @@ data-stream-url="<%= streamUrls[option.language] || '' %>">
     (function () {
         const initialLanguage = "<%= initialLanguage %>";
         const webrtcWhepUrls = JSON.parse(document.body.dataset.webrtcWhepUrls || "{}");
+        const useWebrtcTranslatedAudio = "<%= String(useWebrtcTranslatedAudio) %>" === "true";
         const player = document.getElementById("live-video-player");
         const playerSource = document.getElementById("live-video-source");
         const webrtcAudioPlayer = document.getElementById("webrtc-audio-player");
@@ -474,7 +475,16 @@ data-stream-url="<%= streamUrls[option.language] || '' %>">
 
             options.forEach((button) => setOptionState(button, button === selectedButton));
             refreshViewerCount(language);
-            await startWebrtcAudio(language);
+
+            // Default behavior keeps translated stream audio/video from the same media URL for lip-sync.
+            if (useWebrtcTranslatedAudio && language !== "original") {
+                await startWebrtcAudio(language);
+            } else {
+                stopWebrtcAudio();
+                if (player) {
+                    player.muted = false;
+                }
+            }
         }
 
         options.forEach((button) => {
