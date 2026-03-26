@@ -9,6 +9,7 @@ import { WebSocketServer } from "ws";
 import fs from "fs";
 import path from "path";
 import { SarvamAIClient } from "sarvamai";
+import OpenAI from "openai";
 import wavefilePkg from "wavefile";
 import IVSTranslatorStreamer from "./ivsTranslatorStreamer.js";
 import StreamSessionManager from "./StreamSessionManager.js";
@@ -35,7 +36,6 @@ const TARGET_CHUNK_DURATION_SEC = 2;
 const DUBBING_BATCH_SIZE = 1;
 const MIN_ACCEPTABLE_CHUNK_DURATION_SEC = 1.7;
 const SHORT_CHUNK_SKIP_AGE_MS = 8 * 1000;
-const SARVAM_MAX_SEGMENT_SEC = 29;
 const USE_DIRECT_ELEVENLABS_DUBBING =
   String(process.env.USE_DIRECT_ELEVENLABS_DUBBING || "false").toLowerCase() === "true";
 const DIRECT_DUBBING_CHUNK_DURATION_SEC = Number(process.env.DIRECT_DUBBING_CHUNK_DURATION_SEC || 1);
@@ -71,6 +71,9 @@ let lastRestartTime = 0;
 const sarvamClient = process.env.SARVAM_API_KEY
   ? new SarvamAIClient({ apiSubscriptionKey: process.env.SARVAM_API_KEY })
   : null;
+const openaiClient = process.env.OPENAI_API_KEY
+  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+  : null;
 const elevenlabsClient = process.env.ELEVENLABS_API_KEY
   ? new ElevenLabsClient({ apiKey: process.env.ELEVENLABS_API_KEY })
   : null;
@@ -105,9 +108,22 @@ const PLAYBACK_BASE_URL = normalizePlaybackBaseUrl(
   process.env.CLOUDFRONT_PLAYBACK_BASE_URL || process.env.PLAYBACK_BASE_URL || DEFAULT_PLAYBACK_BASE_URL
 );
 
-const PLAYBACK_CHANNEL_PATHS = {
+const LEGACY_PLAYBACK_CHANNEL_PATHS = {
   original: "/api/video/v1/ap-south-1.281851731848.channel.UqVC4zjntu05.m3u8",
   hindi: "/api/video/v1/ap-south-1.281851731848.channel.dAAx194gnHFl.m3u8",
+};
+
+const PLAYBACK_CHANNEL_PATHS = {
+  original:
+    process.env.PLAYBACK_CHANNEL_PATH_ORIGINAL ||
+    process.env.AWS_IVS_PLAYBACK_URL_ORIGINAL ||
+    process.env.AWS_IVS_PLAYBACK_URL ||
+    process.env.LIVESTREAM_HLS_URL ||
+    LEGACY_PLAYBACK_CHANNEL_PATHS.original,
+  hindi:
+    process.env.PLAYBACK_CHANNEL_PATH_HINDI ||
+    process.env.AWS_IVS_PLAYBACK_URL_HINDI ||
+    LEGACY_PLAYBACK_CHANNEL_PATHS.hindi,
   bangla: process.env.PLAYBACK_CHANNEL_PATH_BANGLA || "",
   tamil: process.env.PLAYBACK_CHANNEL_PATH_TAMIL || "",
 };
@@ -134,6 +150,10 @@ const ivsClient = new IvsClient({ region: IVS_REGION });
 function buildPlaybackUrl(channelPath) {
   if (!channelPath) {
     return null;
+  }
+
+  if (/^https?:\/\//i.test(channelPath)) {
+    return channelPath;
   }
 
   const normalizedPath = channelPath.startsWith("/") ? channelPath : `/${channelPath}`;
@@ -963,75 +983,40 @@ async function createDubbedAudioFromSourceChunk(chunkName, sourceChunkPath) {
   };
 }
 
-async function splitChunkForSarvam(chunkPath) {
-  const baseName = path.basename(chunkPath, path.extname(chunkPath));
-  const splitPattern = path.join(SEGMENT_FOLDER, `${baseName}_sarvam_%03d.wav`);
-
-  await ffmpegRun([
-    "-i",
-    chunkPath,
-    "-f",
-    "segment",
-    "-segment_time",
-    String(SARVAM_MAX_SEGMENT_SEC),
-    "-c:a",
-    "pcm_s16le",
-    "-ar",
-    "16000",
-    "-ac",
-    "1",
-    splitPattern,
-  ]);
-
-  return fs
-    .readdirSync(SEGMENT_FOLDER)
-    .filter((file) => file.startsWith(`${baseName}_sarvam_`) && file.endsWith(".wav"))
-    .sort()
-    .map((file) => path.join(SEGMENT_FOLDER, file));
-}
-
-async function transcribeOneMinuteChunkWithSarvam(chunkPath) {
-  const partFiles = await splitChunkForSarvam(chunkPath);
-  if (partFiles.length === 0) {
-    throw new Error(`No split parts generated for ${path.basename(chunkPath)}`);
+async function transcribeOneMinuteChunkWithWhisper(chunkPath) {
+  if (!openaiClient) {
+    throw new Error("OpenAI API key not configured. Set OPENAI_API_KEY.");
   }
 
   const transcriptParts = [];
   let detectedLanguageCode = "auto";
-  let lastResponse = null;
+  let lastWhisperResponse = null;
 
   try {
-    for (const partPath of partFiles) {
-      const sttResponse = await sarvamClient.speechToText.translate({
-        file: fs.createReadStream(partPath),
-      });
+    const audioStream = fs.createReadStream(chunkPath);
+    const transcription = await openaiClient.audio.transcriptions.create({
+      file: audioStream,
+      model: "whisper-1",
+      language: "en",
+    });
 
-      lastResponse = sttResponse;
-      const partText = extractTranscriptText(sttResponse).trim();
-      if (partText) {
-        transcriptParts.push(partText);
-      }
+    lastWhisperResponse = transcription;
+    const fullText = (transcription?.text || "").trim();
 
-      const responseLanguage = sttResponse?.language_code;
-      if (typeof responseLanguage === "string" && /^[a-z]{2,3}-IN$/i.test(responseLanguage)) {
-        detectedLanguageCode = responseLanguage;
-      }
+    if (fullText) {
+      transcriptParts.push(fullText);
+      detectedLanguageCode = "en-IN";
     }
-  } finally {
-    for (const partPath of partFiles) {
-      try {
-        fs.unlinkSync(partPath);
-      } catch {
-        // Ignore cleanup errors for temp files.
-      }
-    }
+  } catch (err) {
+    console.error(`❌ Whisper transcription failed for ${path.basename(chunkPath)}: ${err.message}`);
+    throw err;
   }
 
   return {
     sourceText: transcriptParts.join(" ").trim(),
     sourceLanguageCode: detectedLanguageCode,
-    sttResponse: lastResponse,
-    partCount: partFiles.length,
+    sttResponse: lastWhisperResponse,
+    partCount: 1,
   };
 }
 
@@ -1369,7 +1354,7 @@ async function processChunkQueue() {
           };
         }
 
-        const transcriptionResult = await transcribeOneMinuteChunkWithSarvam(chunkPath);
+        const transcriptionResult = await transcribeOneMinuteChunkWithWhisper(chunkPath);
         const sourceText = transcriptionResult.sourceText;
         const sourceLanguageCode = transcriptionResult.sourceLanguageCode || "auto";
         const sttResponse = transcriptionResult.sttResponse;

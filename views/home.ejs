@@ -111,9 +111,9 @@ data-webrtc-whep-urls='<%- JSON.stringify(webrtcWhepUrls || {}) %>'>
 </nav>
 </header>
 <!-- Main SPA Body -->
-<main class="flex-1 flex flex-col lg:flex-row max-w-[1440px] mx-auto w-full overflow-visible">
+<main class="flex-1 flex flex-col lg:flex-row max-w-[1440px] mx-auto w-full overflow-hidden min-h-0">
 <!-- Left Column: Primary Video & Controls -->
-<section class="flex-1 flex flex-col p-4 sm:p-6 lg:p-8 space-y-5 sm:space-y-6 overflow-visible min-w-0">
+<section class="flex-1 flex flex-col p-4 sm:p-6 lg:p-8 space-y-5 sm:space-y-6 overflow-visible min-w-0 min-h-0">
 <!-- Header Section -->
 <div class="flex flex-col gap-4 sm:gap-3 sm:flex-row sm:items-end sm:justify-between">
 <div class="space-y-1">
@@ -148,7 +148,9 @@ data-webrtc-whep-urls='<%- JSON.stringify(webrtcWhepUrls || {}) %>'>
       and display of the media. They are easily swappable
       to handle different sources.
     -->
-        <video id="live-video-player" src="<%= streamUrls[initialLanguage] %>" playsinline></video>
+                <video id="live-video-player" src="<%= streamUrls[initialLanguage] %>" playsinline controls autoplay muted preload="auto">
+                    <source id="live-video-source" src="<%= streamUrls[initialLanguage] %>" type="application/x-mpegURL">
+                </video>
                 <audio id="webrtc-audio-player" autoplay playsinline></audio>
   </video-minimal-skin>
 </video-player><!-- Video Overlay UI -->
@@ -173,7 +175,7 @@ data-stream-url="<%= streamUrls[option.language] || '' %>">
 </div>
 </section>
 <!-- Right Column: Contextual Sidebar (Transcript/Captions) -->
-<aside class="w-full lg:w-[340px] xl:w-[380px] border-l border-neutral-100 bg-white flex flex-col flex-none">
+<aside class="w-full lg:w-[340px] xl:w-[380px] border-l border-neutral-100 bg-white flex flex-col flex-none h-[70vh] lg:h-[calc(100vh-6.5rem)] min-h-0">
 <div class="h-14 sm:h-16 px-4 sm:px-6 border-b border-neutral-100 flex items-center justify-between flex-none">
 <div class="flex items-center gap-2">
 <span class="material-symbols-outlined text-primary text-xl">description</span>
@@ -183,7 +185,7 @@ data-stream-url="<%= streamUrls[option.language] || '' %>">
 
 </div>
 <!-- Transcript Content -->
-<div id="transcript-list" class="flex-1 overflow-y-auto p-4 sm:p-6 space-y-6 no-scrollbar">
+<div id="transcript-list" class="flex-1 min-h-0 overflow-y-auto p-4 sm:p-6 space-y-6 no-scrollbar">
 <div class="bg-surface-container-low p-4 border border-outline-variant">
 <p class="text-sm text-on-surface-variant leading-relaxed">Waiting for live transcript...</p>
 </div>
@@ -204,6 +206,7 @@ data-stream-url="<%= streamUrls[option.language] || '' %>">
         const initialLanguage = "<%= initialLanguage %>";
         const webrtcWhepUrls = JSON.parse(document.body.dataset.webrtcWhepUrls || "{}");
         const player = document.getElementById("live-video-player");
+        const playerSource = document.getElementById("live-video-source");
         const webrtcAudioPlayer = document.getElementById("webrtc-audio-player");
         const activeListeners = document.getElementById("active-listeners-count");
         const transcriptList = document.getElementById("transcript-list");
@@ -462,6 +465,9 @@ data-stream-url="<%= streamUrls[option.language] || '' %>">
 
             if (player.getAttribute("src") !== selectedUrl) {
                 player.setAttribute("src", selectedUrl);
+                if (playerSource) {
+                    playerSource.setAttribute("src", selectedUrl);
+                }
                 player.load();
                 player.play().catch(() => {});
             }
