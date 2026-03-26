@@ -1,9 +1,11 @@
 import express from "express";
+import http from "http";
 import dotenv from "dotenv";
 import { spawn } from "child_process";
 import ffmpegPath from "ffmpeg-static";
 import ivsSdk from "@aws-sdk/client-ivs";
 import { ElevenLabsClient } from "@elevenlabs/elevenlabs-js";
+import { WebSocketServer } from "ws";
 import fs from "fs";
 import path from "path";
 import { SarvamAIClient } from "sarvamai";
@@ -108,6 +110,13 @@ const PLAYBACK_CHANNEL_PATHS = {
   hindi: "/api/video/v1/ap-south-1.281851731848.channel.dAAx194gnHFl.m3u8",
   bangla: process.env.PLAYBACK_CHANNEL_PATH_BANGLA || "",
   tamil: process.env.PLAYBACK_CHANNEL_PATH_TAMIL || "",
+};
+
+const WEBRTC_WHEP_URLS = {
+  original: String(process.env.WEBRTC_WHEP_URL_ORIGINAL || "").trim(),
+  hindi: String(process.env.WEBRTC_WHEP_URL_HINDI || "").trim(),
+  bangla: String(process.env.WEBRTC_WHEP_URL_BANGLA || "").trim(),
+  tamil: String(process.env.WEBRTC_WHEP_URL_TAMIL || "").trim(),
 };
 
 const IVS_REGION = process.env.AWS_REGION || process.env.AWS_IVS_REGION || "ap-south-1";
@@ -326,6 +335,57 @@ let dubbingReferenceSessionId = null;
 let realtimePipelineTimelineSec = 0;
 const hindiPipelineOutputBuffer = new Map();
 let nextHindiPipelineSeqToSend = 1;
+
+const httpServer = http.createServer(app);
+const transcriptWebSocketPath = "/ws/transcripts";
+const transcriptWss = new WebSocketServer({ server: httpServer, path: transcriptWebSocketPath });
+const transcriptClients = new Set();
+
+function sendWebSocketMessage(ws, payload) {
+  if (!ws || ws.readyState !== 1) {
+    return;
+  }
+
+  ws.send(JSON.stringify(payload));
+}
+
+function getLatestTranscriptEntries() {
+  return transcriptResults
+    .slice(-20)
+    .filter((entry) => entry && (entry.sourceText || entry?.translations?.hindi?.text));
+}
+
+function broadcastTranscriptEntry(entry) {
+  if (!entry) {
+    return;
+  }
+
+  const payload = {
+    type: "transcript-new",
+    entry,
+  };
+
+  for (const client of transcriptClients) {
+    sendWebSocketMessage(client, payload);
+  }
+}
+
+transcriptWss.on("connection", (ws) => {
+  transcriptClients.add(ws);
+
+  sendWebSocketMessage(ws, {
+    type: "transcript-init",
+    entries: getLatestTranscriptEntries(),
+  });
+
+  ws.on("close", () => {
+    transcriptClients.delete(ws);
+  });
+
+  ws.on("error", () => {
+    transcriptClients.delete(ws);
+  });
+});
 
 async function flushHindiPipelineOutputBuffer(sessionId, hindiStreamer) {
   const flushedSeqIds = [];
@@ -1468,7 +1528,7 @@ async function processChunkQueue() {
             sessionManager.incrementChunkCount(sessionId, "hindi");
             sessionManager.incrementChunkCount(sessionId, "source");
 
-            transcriptResults.push({
+            const transcriptEntry = {
               chunk: chunk.chunkName,
               sequenceNumber: chunk.sequenceNumber,
               sessionId: sessionId,
@@ -1482,7 +1542,10 @@ async function processChunkQueue() {
               },
               sttResponse: chunk.sttResponse,
               at: new Date().toISOString(),
-            });
+            };
+
+            transcriptResults.push(transcriptEntry);
+            broadcastTranscriptEntry(transcriptEntry);
 
             processedChunks.add(chunk.chunkPath);
             chunkSequenceNumbers.delete(chunk.chunkPath);
@@ -1539,7 +1602,7 @@ async function processChunkQueue() {
           sessionManager.incrementChunkCount(sessionId, "hindi");
           sessionManager.incrementChunkCount(sessionId, "source");
 
-          transcriptResults.push({
+          const transcriptEntry = {
             chunk: chunk.chunkName,
             sequenceNumber: chunk.sequenceNumber,
             sessionId: sessionId,
@@ -1553,7 +1616,10 @@ async function processChunkQueue() {
             },
             sttResponse: chunk.sttResponse,
             at: new Date().toISOString(),
-          });
+          };
+
+          transcriptResults.push(transcriptEntry);
+          broadcastTranscriptEntry(transcriptEntry);
 
           processedChunks.add(chunk.chunkPath);
           chunkSequenceNumbers.delete(chunk.chunkPath);
@@ -1926,6 +1992,7 @@ app.get("/", async (req, res) => {
 
   res.render("home.ejs", {
     streamUrls,
+    webrtcWhepUrls: WEBRTC_WHEP_URLS,
     streamOptions,
     playbackBaseUrl: PLAYBACK_BASE_URL,
     viewerLocation,
@@ -2163,7 +2230,7 @@ if (!getStreamURL() && process.env.TEST_MODE !== "true") {
 
 // Start server
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, async () => {
+httpServer.listen(PORT, async () => {
   console.log(
     `\n🚀 Server running on http://localhost:${PORT}`
   );

@@ -92,7 +92,8 @@
         .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
     </style>
 </head>
-<body class="bg-surface text-on-surface min-h-screen selection:bg-primary selection:text-on-primary overflow-x-hidden overflow-y-auto flex flex-col">
+<body class="bg-surface text-on-surface min-h-screen selection:bg-primary selection:text-on-primary overflow-x-hidden overflow-y-auto flex flex-col"
+data-webrtc-whep-urls='<%- JSON.stringify(webrtcWhepUrls || {}) %>'>
 <!-- Script Ghosts -->
 <div class="script-ghost top-10 -left-10">अ</div>
 <div class="script-ghost bottom-10 -right-10">క</div>
@@ -125,14 +126,8 @@
 <span id="active-listeners-count"><%= initialLiveViewerCountLabel %></span> active listeners
 </p>
 </div>
-<div class="flex gap-2 w-full sm:w-auto">
-<button class="flex items-center justify-center gap-2 px-3 sm:px-4 py-2 border border-outline-variant hover:bg-neutral-50 transition-colors rounded text-xs sm:text-sm font-bold flex-1 sm:flex-none">
-<span class="material-symbols-outlined text-sm">share</span> Share
-                </button>
-<button class="flex items-center justify-center gap-2 px-3 sm:px-4 py-2 bg-primary text-white hover:bg-neutral-800 transition-colors rounded text-xs sm:text-sm font-bold flex-1 sm:flex-none">
-<span class="material-symbols-outlined text-sm">record_voice_over</span> AI Cast
-                </button>
-</div>
+
+
 </div>
 <!-- Central Player -->
 <div class="relative aspect-video bg-black rounded-xl overflow-hidden shadow-2xl group ring-1 ring-black/5">
@@ -154,6 +149,7 @@
       to handle different sources.
     -->
         <video id="live-video-player" src="<%= streamUrls[initialLanguage] %>" playsinline></video>
+                <audio id="webrtc-audio-player" autoplay playsinline></audio>
   </video-minimal-skin>
 </video-player><!-- Video Overlay UI -->
 
@@ -183,78 +179,18 @@ data-stream-url="<%= streamUrls[option.language] || '' %>">
 <span class="material-symbols-outlined text-primary text-xl">description</span>
 <span class="font-headline font-bold text-sm">Real-time Transcript</span>
 </div>
-<div class="flex gap-2">
-<button class="p-1 hover:bg-neutral-50 rounded"><span class="material-symbols-outlined text-lg">download</span></button>
-<button class="p-1 hover:bg-neutral-50 rounded"><span class="material-symbols-outlined text-lg">more_vert</span></button>
-</div>
+
+
 </div>
 <!-- Transcript Content -->
-<div class="flex-1 overflow-y-auto p-4 sm:p-6 space-y-6 no-scrollbar">
-<!-- Chunk 1 -->
-<div class="space-y-3">
-<div class="flex items-center justify-between">
-<span class="text-[10px] font-bold text-outline uppercase tracking-tighter">00:42:01 • ENG</span>
-<span class="text-[10px] font-bold text-primary uppercase tracking-tighter">Hindi Active</span>
-</div>
-<div class="space-y-3">
-<p class="text-xs text-on-surface-variant leading-relaxed italic border-l-2 border-neutral-100 pl-3">
-                        "The potential for AI to bridge cultural gaps in the next decade is unprecedented."
-                    </p>
-<div class="bg-surface-container-low p-4 border-l-4 border-primary">
-<p class="text-sm font-medium text-on-surface leading-relaxed">
-                            "अगले दशक में सांस्कृतिक दूरियों को पाटने के लिए एआई की क्षमता अभूतपूर्व है।"
-                        </p>
-</div>
-</div>
-</div>
-<!-- Chunk 2 -->
-<div class="space-y-3">
-<div class="flex items-center justify-between">
-<span class="text-[10px] font-bold text-outline uppercase tracking-tighter">00:42:08 • ENG</span>
-</div>
-<div class="space-y-3">
-<p class="text-xs text-on-surface-variant leading-relaxed italic border-l-2 border-neutral-100 pl-3">
-                        "We are focusing on modular architectures that prioritize local dialect accuracy."
-                    </p>
-<div class="bg-surface-container-low p-4">
-<p class="text-sm font-medium text-on-surface leading-relaxed">
-                            "हम मॉड्यूलर आर्किटेक्चर पर ध्यान केंद्रित कर रहे हैं जो स्थानीय बोली की सटीकता को प्राथमिकता देते हैं।"
-                        </p>
-</div>
-</div>
-</div>
-<!-- Active Processing -->
-<div class="space-y-3 opacity-60">
-<div class="flex items-center justify-between">
-<span class="text-[10px] font-bold text-outline uppercase tracking-tighter">00:42:14 • Processing</span>
-<div class="flex gap-1">
-<span class="w-1 h-1 bg-primary rounded-full animate-bounce"></span>
-<span class="w-1 h-1 bg-primary rounded-full animate-bounce [animation-delay:0.2s]"></span>
-<span class="w-1 h-1 bg-primary rounded-full animate-bounce [animation-delay:0.4s]"></span>
-</div>
-</div>
-<p class="text-xs text-on-surface-variant leading-relaxed italic border-l-2 border-neutral-100 pl-3">
-                    "Integrating these systems into the daily workflow of billion users..."
-                </p>
-<div class="bg-surface-container-low p-4 border border-dashed border-outline-variant">
-<div class="h-3 w-3/4 bg-neutral-200 rounded animate-pulse"></div>
-</div>
+<div id="transcript-list" class="flex-1 overflow-y-auto p-4 sm:p-6 space-y-6 no-scrollbar">
+<div class="bg-surface-container-low p-4 border border-outline-variant">
+<p class="text-sm text-on-surface-variant leading-relaxed">Waiting for live transcript...</p>
 </div>
 </div>
 <!-- Sidebar Footer Actions -->
-<div class="p-4 sm:p-6 border-t border-neutral-100 bg-white space-y-3 flex-none">
-<div class="flex gap-2">
-<button class="flex-1 py-3 bg-neutral-900 text-white text-[10px] font-black uppercase tracking-widest hover:bg-black transition-colors">
-                    Export Session
-                </button>
-<button class="flex-1 py-3 border border-neutral-200 text-neutral-900 text-[10px] font-black uppercase tracking-widest hover:bg-neutral-50 transition-colors">
-                    Search Text
-                </button>
-</div>
-<p class="text-[9px] text-center text-neutral-400 font-bold uppercase tracking-widest">
-                System Latency: 42ms • Precision: 98.4%
-            </p>
-</div>
+
+
 </aside>
 </main>
 <footer class="w-full min-h-10 px-4 sm:px-8 py-2 bg-white border-t border-neutral-100 flex items-center justify-between flex-none">
@@ -266,9 +202,20 @@ data-stream-url="<%= streamUrls[option.language] || '' %>">
 <script>
     (function () {
         const initialLanguage = "<%= initialLanguage %>";
+        const webrtcWhepUrls = JSON.parse(document.body.dataset.webrtcWhepUrls || "{}");
         const player = document.getElementById("live-video-player");
+        const webrtcAudioPlayer = document.getElementById("webrtc-audio-player");
         const activeListeners = document.getElementById("active-listeners-count");
+        const transcriptList = document.getElementById("transcript-list");
         const options = Array.from(document.querySelectorAll(".stream-option"));
+        const transcriptWebSocketPath = "/ws/transcripts";
+        const transcriptReconnectDelayMs = 1200;
+        const maxTranscriptEntries = 20;
+        let transcriptSocket = null;
+        let transcriptReconnectTimer = null;
+        let transcriptEntries = [];
+        let webrtcPeerConnection = null;
+        let activeWebrtcLanguage = null;
 
         const selectedClasses = ["border-2", "border-primary", "bg-white"];
         const unselectedClasses = ["border", "border-outline-variant", "bg-surface-container-low"];
@@ -307,7 +254,206 @@ data-stream-url="<%= streamUrls[option.language] || '' %>">
             }
         }
 
-        function activateStream(language) {
+        function escapeHtml(value) {
+            return String(value || "")
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/\"/g, "&quot;")
+                .replace(/'/g, "&#39;");
+        }
+
+        function normalizeTranscriptEntries(entries) {
+            if (!Array.isArray(entries)) {
+                return [];
+            }
+
+            return entries
+                .filter((entry) => entry && (entry.sourceText || entry?.translations?.hindi?.text))
+                .slice(-maxTranscriptEntries);
+        }
+
+        function renderTranscriptEntries(entries) {
+            if (!transcriptList) return;
+
+            if (!entries.length) {
+                transcriptList.innerHTML = `
+                    <div class="bg-surface-container-low p-4 border border-outline-variant">
+                        <p class="text-sm text-on-surface-variant leading-relaxed">Waiting for live transcript...</p>
+                    </div>
+                `;
+                return;
+            }
+
+            const blocks = entries.map((entry) => {
+                const sourceText = (entry.sourceText || "").trim();
+                const translatedText = (entry?.translations?.hindi?.text || "").trim();
+                return `
+                    <div class="space-y-3">
+                        <p class="text-xs text-on-surface-variant leading-relaxed italic border-l-2 border-neutral-100 pl-3">${escapeHtml(sourceText || "[source unavailable]")}</p>
+                        <div class="bg-surface-container-low p-4 border-l-4 border-primary">
+                            <p class="text-sm font-medium text-on-surface leading-relaxed">${escapeHtml(translatedText || "[translation unavailable]")}</p>
+                        </div>
+                    </div>
+                `;
+            });
+
+            transcriptList.innerHTML = blocks.join("");
+            transcriptList.scrollTop = transcriptList.scrollHeight;
+        }
+
+        function scheduleTranscriptReconnect() {
+            if (transcriptReconnectTimer) {
+                clearTimeout(transcriptReconnectTimer);
+            }
+
+            transcriptReconnectTimer = setTimeout(connectTranscriptWebSocket, transcriptReconnectDelayMs);
+        }
+
+        function connectTranscriptWebSocket() {
+            const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+            const wsUrl = `${protocol}://${window.location.host}${transcriptWebSocketPath}`;
+
+            transcriptSocket = new WebSocket(wsUrl);
+
+            transcriptSocket.addEventListener("message", (event) => {
+                let message;
+
+                try {
+                    message = JSON.parse(event.data || "{}");
+                } catch (err) {
+                    return;
+                }
+
+                if (message.type === "transcript-init") {
+                    transcriptEntries = normalizeTranscriptEntries(message.entries || []);
+                    renderTranscriptEntries(transcriptEntries);
+                    return;
+                }
+
+                if (message.type === "transcript-new" && message.entry) {
+                    transcriptEntries = normalizeTranscriptEntries([...transcriptEntries, message.entry]);
+                    renderTranscriptEntries(transcriptEntries);
+                }
+            });
+
+            transcriptSocket.addEventListener("close", () => {
+                scheduleTranscriptReconnect();
+            });
+
+            transcriptSocket.addEventListener("error", () => {
+                if (transcriptSocket && transcriptSocket.readyState === WebSocket.OPEN) {
+                    transcriptSocket.close();
+                }
+            });
+        }
+
+        function waitForIceGatheringComplete(peerConnection, timeoutMs = 3000) {
+            if (!peerConnection || peerConnection.iceGatheringState === "complete") {
+                return Promise.resolve();
+            }
+
+            return new Promise((resolve) => {
+                let timeoutId;
+
+                function onStateChange() {
+                    if (peerConnection.iceGatheringState === "complete") {
+                        clearTimeout(timeoutId);
+                        peerConnection.removeEventListener("icegatheringstatechange", onStateChange);
+                        resolve();
+                    }
+                }
+
+                timeoutId = setTimeout(() => {
+                    peerConnection.removeEventListener("icegatheringstatechange", onStateChange);
+                    resolve();
+                }, timeoutMs);
+
+                peerConnection.addEventListener("icegatheringstatechange", onStateChange);
+            });
+        }
+
+        function stopWebrtcAudio() {
+            activeWebrtcLanguage = null;
+
+            if (webrtcPeerConnection) {
+                webrtcPeerConnection.close();
+                webrtcPeerConnection = null;
+            }
+
+            if (webrtcAudioPlayer) {
+                webrtcAudioPlayer.pause();
+                webrtcAudioPlayer.srcObject = null;
+            }
+
+            if (player) {
+                player.muted = false;
+            }
+        }
+
+        async function startWebrtcAudio(language) {
+            const whepUrl = String(webrtcWhepUrls?.[language] || "").trim();
+            if (!whepUrl || !window.RTCPeerConnection || !webrtcAudioPlayer) {
+                stopWebrtcAudio();
+                return false;
+            }
+
+            if (activeWebrtcLanguage === language && webrtcPeerConnection) {
+                return true;
+            }
+
+            stopWebrtcAudio();
+
+            try {
+                const peerConnection = new RTCPeerConnection({
+                    iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+                });
+
+                peerConnection.addTransceiver("audio", { direction: "recvonly" });
+                peerConnection.addEventListener("track", (event) => {
+                    const [stream] = event.streams || [];
+                    if (!stream) return;
+                    webrtcAudioPlayer.srcObject = stream;
+                    webrtcAudioPlayer.play().catch(() => {});
+                });
+
+                const offer = await peerConnection.createOffer({
+                    offerToReceiveAudio: true,
+                    offerToReceiveVideo: false,
+                });
+                await peerConnection.setLocalDescription(offer);
+                await waitForIceGatheringComplete(peerConnection);
+
+                const response = await fetch(whepUrl, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/sdp",
+                    },
+                    body: peerConnection.localDescription?.sdp || "",
+                });
+
+                if (!response.ok) {
+                    throw new Error(`WHEP handshake failed: ${response.status}`);
+                }
+
+                const answerSdp = await response.text();
+                await peerConnection.setRemoteDescription({ type: "answer", sdp: answerSdp });
+
+                webrtcPeerConnection = peerConnection;
+                activeWebrtcLanguage = language;
+
+                if (player) {
+                    player.muted = true;
+                }
+
+                return true;
+            } catch (err) {
+                stopWebrtcAudio();
+                return false;
+            }
+        }
+
+        async function activateStream(language) {
             const selectedButton = options.find((button) => button.dataset.language === language);
             if (!selectedButton) return;
 
@@ -322,6 +468,7 @@ data-stream-url="<%= streamUrls[option.language] || '' %>">
 
             options.forEach((button) => setOptionState(button, button === selectedButton));
             refreshViewerCount(language);
+            await startWebrtcAudio(language);
         }
 
         options.forEach((button) => {
@@ -333,10 +480,13 @@ data-stream-url="<%= streamUrls[option.language] || '' %>">
                 return;
             }
 
-            button.addEventListener("click", () => activateStream(button.dataset.language));
+            button.addEventListener("click", () => {
+                activateStream(button.dataset.language);
+            });
         });
 
         activateStream(initialLanguage);
+        connectTranscriptWebSocket();
     })();
 </script>
 </body></html>
