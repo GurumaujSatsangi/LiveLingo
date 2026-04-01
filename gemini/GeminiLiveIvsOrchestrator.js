@@ -1,6 +1,5 @@
 import { EventEmitter } from "events";
 import StreamingAudioIngester from "../StreamingAudioIngester.js";
-import VadSegmenter from "./VadSegmenter.js";
 import GeminiLanguagePipeline from "./GeminiLanguagePipeline.js";
 
 const DEFAULT_LANGUAGES = [
@@ -18,7 +17,15 @@ class GeminiLiveIvsOrchestrator extends EventEmitter {
     this.model = options.model || process.env.GEMINI_LIVE_MODEL || "gemini-3.1-flash-live-preview";
     this.sampleRate = 16000;
     this.channels = 1;
+    this.bytesPerSample = 2;
     this.languages = options.languages || DEFAULT_LANGUAGES;
+    this.chunkMs = Number(options.chunkMs || process.env.GEMINI_AUDIO_CHUNK_MS || 1200);
+    this.chunkBytes = Math.max(
+      this.sampleRate * this.channels * this.bytesPerSample,
+      Math.floor((this.sampleRate * this.channels * this.bytesPerSample * this.chunkMs) / 1000)
+    );
+    this.pendingAudio = Buffer.alloc(0);
+    this.nextSegmentId = 1;
 
     this.metricsIntervalMs = Number(options.metricsIntervalMs || process.env.GEMINI_METRICS_INTERVAL_MS || 5000);
     this.maxBroadcastLagMs = Number(options.maxBroadcastLagMs || process.env.GEMINI_MAX_BROADCAST_LAG_MS || 2500);
@@ -31,16 +38,6 @@ class GeminiLiveIvsOrchestrator extends EventEmitter {
       maxBufferSize: Number(options.ingesterMaxBufferBytes || process.env.GEMINI_INGESTER_MAX_BUFFER_BYTES || 256000),
       maxRestartAttempts: Number(options.ingesterRestartAttempts || process.env.GEMINI_INGESTER_MAX_RESTARTS || 50),
       restartDelay: Number(options.ingesterRestartDelayMs || process.env.GEMINI_INGESTER_RESTART_DELAY_MS || 1500),
-    });
-
-    this.vad = new VadSegmenter({
-      sampleRate: this.sampleRate,
-      channels: this.channels,
-      frameMs: Number(options.vadFrameMs || process.env.GEMINI_FRAME_MS || 20),
-      silenceMs: Number(options.vadSilenceMs || process.env.GEMINI_VAD_SILENCE_MS || 400),
-      maxChunkMs: Number(options.vadMaxChunkMs || process.env.GEMINI_MAX_CHUNK_MS || 5000),
-      minSpeechMs: Number(options.vadMinChunkMs || process.env.GEMINI_MIN_CHUNK_MS || 250),
-      energyThreshold: Number(options.vadEnergyThreshold || process.env.GEMINI_VAD_ENERGY_THRESHOLD || 0.016),
     });
 
     this.languagePipelines = new Map();
@@ -56,22 +53,57 @@ class GeminiLiveIvsOrchestrator extends EventEmitter {
       totalSegmentBytes: 0,
     };
 
+    this.chunkerStats = {
+      segmentsEmitted: 0,
+      bytesBuffered: 0,
+      chunkBytes: this.chunkBytes,
+      chunkMs: this.chunkMs,
+    };
+
     this.bindEvents();
   }
 
   bindEvents() {
     this.ingester.on("audio-data", (chunk) => {
       this.stats.audioChunksSeen += 1;
-      this.vad.processAudio(chunk);
+      this.pendingAudio = Buffer.concat([this.pendingAudio, chunk]);
+
+      while (this.pendingAudio.length >= this.chunkBytes) {
+        const segmentBuffer = this.pendingAudio.slice(0, this.chunkBytes);
+        this.pendingAudio = this.pendingAudio.slice(this.chunkBytes);
+        this.emitFixedChunk(segmentBuffer, "fixed_chunk");
+      }
+
+      this.chunkerStats.bytesBuffered = this.pendingAudio.length;
     });
 
     this.ingester.on("fatal-error", (err) => {
       this.emit("error", new Error(`Audio ingester fatal error: ${err.message}`));
     });
+  }
 
-    this.vad.on("segment", (segment) => {
-      this.broadcastSegment(segment);
+  emitFixedChunk(buffer, reason = "fixed_chunk") {
+    if (!buffer?.length || !Buffer.isBuffer(buffer)) {
+      return;
+    }
+
+    const durationMs = Math.floor(
+      (buffer.length / (this.sampleRate * this.channels * this.bytesPerSample)) * 1000
+    );
+
+    this.chunkerStats.segmentsEmitted += 1;
+
+    this.broadcastSegment({
+      segmentId: this.nextSegmentId,
+      reason,
+      buffer,
+      durationMs,
+      frameMs: this.chunkMs,
+      emittedAt: Date.now(),
+      startedAt: Date.now() - durationMs,
     });
+
+    this.nextSegmentId += 1;
   }
 
   buildLanguagePipelines() {
@@ -189,7 +221,10 @@ class GeminiLiveIvsOrchestrator extends EventEmitter {
       uptimeMs: this.stats.startedAt ? Date.now() - this.stats.startedAt : 0,
       ...this.stats,
       ingester: this.ingester.getStats(),
-      vad: this.vad.getStats(),
+      chunker: {
+        ...this.chunkerStats,
+        bytesBuffered: this.pendingAudio.length,
+      },
       languages: languageStats,
     };
   }
@@ -200,7 +235,13 @@ class GeminiLiveIvsOrchestrator extends EventEmitter {
     }
 
     this.stopMetricsLogger();
-    this.vad.flush("shutdown");
+
+    if (this.pendingAudio.length > 0) {
+      this.emitFixedChunk(this.pendingAudio, "shutdown_flush");
+      this.pendingAudio = Buffer.alloc(0);
+      this.chunkerStats.bytesBuffered = 0;
+    }
+
     await this.ingester.stop();
 
     for (const pipeline of this.languagePipelines.values()) {

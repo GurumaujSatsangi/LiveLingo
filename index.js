@@ -135,7 +135,7 @@ function attachOrchestratorListeners(instance) {
       `uptimeSec=${(stats.uptimeMs / 1000).toFixed(1)}`,
       `segments=${stats.segmentsBroadcast}`,
       `dropped=${stats.segmentsDroppedByLag}`,
-      `vadSegments=${stats.vad.segmentsEmitted}`,
+      `chunkSegments=${stats.chunker?.segmentsEmitted ?? 0}`,
       `hiQ=${hi?.segmentQueueDepth ?? 0}`,
       `taQ=${ta?.segmentQueueDepth ?? 0}`,
       `bnQ=${bn?.segmentQueueDepth ?? 0}`,
