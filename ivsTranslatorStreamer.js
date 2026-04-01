@@ -536,12 +536,12 @@ class IVSTranslatorStreamer {
   getNextTranslatedFrame() {
     // Load next in-order chunk when available.
     if (!this.currentChunk) {
-      const nextBuffer = this.pendingChunks.get(this.nextSequenceToPlay);
-      if (nextBuffer) {
+      const nextEntry = this.pendingChunks.get(this.nextSequenceToPlay);
+      if (nextEntry) {
         this.pendingChunks.delete(this.nextSequenceToPlay);
         this.currentChunk = {
           seq: this.nextSequenceToPlay,
-          buffer: nextBuffer,
+          buffer: nextEntry,
           offset: 0,
         };
         this.missingSequenceSince = null;
