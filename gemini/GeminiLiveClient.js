@@ -48,6 +48,7 @@ class GeminiLiveClient extends EventEmitter {
     this.totalAudioOutBytes = 0;
     this.totalMessagesIn = 0;
     this.totalMessagesOut = 0;
+    this.totalTurnComplete = 0;
   }
 
   buildSystemInstruction() {
@@ -240,15 +241,22 @@ class GeminiLiveClient extends EventEmitter {
       return;
     }
 
-    if (message.serverContent?.inputTranscription?.text) {
-      this.emit("input-transcript", message.serverContent.inputTranscription.text);
+    const serverContent = message.serverContent;
+
+    if (serverContent?.inputTranscription?.text) {
+      this.emit("input-transcript", serverContent.inputTranscription.text);
     }
 
-    if (message.serverContent?.outputTranscription?.text) {
-      this.emit("output-transcript", message.serverContent.outputTranscription.text);
+    if (serverContent?.outputTranscription?.text) {
+      this.emit("output-transcript", serverContent.outputTranscription.text);
     }
 
-    const parts = message.serverContent?.modelTurn?.parts || [];
+    if (serverContent?.turnComplete === true) {
+      this.totalTurnComplete += 1;
+      this.emit("turn-complete", { receivedAt: Date.now() });
+    }
+
+    const parts = serverContent?.modelTurn?.parts || [];
     for (const part of parts) {
       const inlineData = part?.inlineData;
       if (!inlineData?.data) {
@@ -411,6 +419,7 @@ class GeminiLiveClient extends EventEmitter {
       totalAudioOutBytes: this.totalAudioOutBytes,
       totalMessagesIn: this.totalMessagesIn,
       totalMessagesOut: this.totalMessagesOut,
+      totalTurnComplete: this.totalTurnComplete,
     };
   }
 

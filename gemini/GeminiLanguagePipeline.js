@@ -14,7 +14,12 @@ class GeminiLanguagePipeline extends EventEmitter {
     this.sourceVideoUrl = options.sourceVideoUrl || "";
     this.sessionId = options.sessionId || `gemini_${this.languageCode}_${Date.now()}`;
     this.maxSegmentQueue = Number(options.maxSegmentQueue || process.env.GEMINI_SEGMENT_QUEUE_MAX || 60);
-    this.segmentFrameMs = Number(options.segmentFrameMs || process.env.GEMINI_SEND_FRAME_MS || 100);
+    this.segmentFrameMs = Number(options.segmentFrameMs || process.env.GEMINI_SEND_FRAME_MS || 40);
+    this.realtimeLatestOnly =
+      String(options.realtimeLatestOnly ?? process.env.GEMINI_REALTIME_LATEST_ONLY ?? "true").toLowerCase() !== "false";
+    this.maxSegmentAgeBeforeSendMs = Number(
+      options.maxSegmentAgeBeforeSendMs || process.env.GEMINI_MAX_SEGMENT_AGE_BEFORE_SEND_MS || 2500
+    );
 
     this.geminiClient = new GeminiLiveClient({
       apiKey: options.geminiApiKey,
@@ -40,6 +45,12 @@ class GeminiLanguagePipeline extends EventEmitter {
     this.sendingLoopRunning = false;
     this.closed = false;
     this.lastNotReadyWarningAt = 0;
+    this.turnWaitTimeoutMs = Number(options.turnWaitTimeoutMs || process.env.GEMINI_TURN_COMPLETE_TIMEOUT_MS || 1800);
+    this.segmentDedupeWindowMs = Number(options.segmentDedupeWindowMs || process.env.GEMINI_SEGMENT_DEDUPE_WINDOW_MS || 8000);
+    this.segmentDedupeSimilarity = Number(options.segmentDedupeSimilarity || process.env.GEMINI_SEGMENT_DEDUPE_SIMILARITY || 0.992);
+    this.segmentFingerprintBins = Number(options.segmentFingerprintBins || process.env.GEMINI_SEGMENT_FINGERPRINT_BINS || 12);
+    this.recentSegmentFingerprints = [];
+    this.pendingTurnCompletion = null;
 
     this.outputSeq = 1;
     this.pendingLatency = [];
@@ -47,6 +58,9 @@ class GeminiLanguagePipeline extends EventEmitter {
     this.stats = {
       segmentsEnqueued: 0,
       segmentsDropped: 0,
+      segmentsDeduped: 0,
+      segmentsDroppedStaleBeforeSend: 0,
+      segmentsReplacedLatestOnly: 0,
       segmentsSkippedNoConnection: 0,
       segmentsSent: 0,
       geminiAudioPackets: 0,
@@ -96,6 +110,136 @@ class GeminiLanguagePipeline extends EventEmitter {
     this.geminiClient.on("fatal", (err) => {
       this.emit("error", new Error(`[${this.languageCode}] Gemini fatal: ${err.message}`));
     });
+
+    this.geminiClient.on("turn-complete", () => {
+      if (this.pendingTurnCompletion) {
+        this.pendingTurnCompletion.resolve(true);
+        this.pendingTurnCompletion = null;
+      }
+    });
+  }
+
+  buildSegmentFingerprint(buffer) {
+    if (!Buffer.isBuffer(buffer) || buffer.length < 160) {
+      return null;
+    }
+
+    const bins = Math.max(8, this.segmentFingerprintBins);
+    const sampleCount = Math.floor(buffer.length / 2);
+    if (sampleCount <= 0) {
+      return null;
+    }
+
+    const energyBins = new Array(bins).fill(0);
+    const counts = new Array(bins).fill(0);
+    let squaredSum = 0;
+
+    for (let i = 0; i < sampleCount; i += 1) {
+      const sample = buffer.readInt16LE(i * 2) / 32768;
+      const absValue = Math.abs(sample);
+      const bin = Math.min(bins - 1, Math.floor((i * bins) / sampleCount));
+
+      energyBins[bin] += absValue;
+      counts[bin] += 1;
+      squaredSum += sample * sample;
+    }
+
+    for (let i = 0; i < bins; i += 1) {
+      if (counts[i] > 0) {
+        energyBins[i] /= counts[i];
+      }
+    }
+
+    const rms = Math.sqrt(squaredSum / sampleCount);
+    return [...energyBins, rms];
+  }
+
+  cosineSimilarity(a, b) {
+    if (!a || !b || a.length !== b.length) {
+      return 0;
+    }
+
+    let dot = 0;
+    let normA = 0;
+    let normB = 0;
+    for (let i = 0; i < a.length; i += 1) {
+      dot += a[i] * b[i];
+      normA += a[i] * a[i];
+      normB += b[i] * b[i];
+    }
+
+    if (normA <= 0 || normB <= 0) {
+      return 0;
+    }
+
+    return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+  }
+
+  pruneRecentSegmentFingerprints(now) {
+    this.recentSegmentFingerprints = this.recentSegmentFingerprints.filter(
+      (entry) => now - entry.at <= this.segmentDedupeWindowMs
+    );
+  }
+
+  shouldDropDuplicateSegment(segmentEvent) {
+    const fingerprint = this.buildSegmentFingerprint(segmentEvent.buffer);
+    if (!fingerprint) {
+      return false;
+    }
+
+    const now = Date.now();
+    this.pruneRecentSegmentFingerprints(now);
+
+    let best = 0;
+    for (const entry of this.recentSegmentFingerprints) {
+      const similarity = this.cosineSimilarity(fingerprint, entry.fingerprint);
+      if (similarity > best) {
+        best = similarity;
+      }
+    }
+
+    if (best >= this.segmentDedupeSimilarity) {
+      this.stats.segmentsDeduped += 1;
+      this.emit(
+        "warning",
+        `[${this.languageCode}] Dropped near-duplicate source segment ${segmentEvent.segmentId} similarity=${best.toFixed(4)}`
+      );
+      return true;
+    }
+
+    this.recentSegmentFingerprints.push({
+      at: now,
+      segmentId: segmentEvent.segmentId,
+      fingerprint,
+    });
+    return false;
+  }
+
+  waitForTurnCompletion(segmentId) {
+    if (this.pendingTurnCompletion) {
+      this.pendingTurnCompletion.resolve(false);
+      this.pendingTurnCompletion = null;
+    }
+
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        if (this.pendingTurnCompletion) {
+          this.pendingTurnCompletion = null;
+          this.emit(
+            "warning",
+            `[${this.languageCode}] turn-complete timeout for segment ${segmentId}; continuing to keep stream realtime`
+          );
+          resolve(false);
+        }
+      }, this.turnWaitTimeoutMs);
+
+      this.pendingTurnCompletion = {
+        resolve: (completed) => {
+          clearTimeout(timeout);
+          resolve(completed);
+        },
+      };
+    });
   }
 
   updateAvgLatency(valueMs) {
@@ -122,7 +266,17 @@ class GeminiLanguagePipeline extends EventEmitter {
       return false;
     }
 
+    if (this.shouldDropDuplicateSegment(segmentEvent)) {
+      return false;
+    }
+
     this.stats.segmentsEnqueued += 1;
+
+    if (this.realtimeLatestOnly && this.segmentQueue.length > 0) {
+      // Meet-like policy: keep only the newest unsent speech slice to stay current.
+      this.stats.segmentsReplacedLatestOnly += this.segmentQueue.length;
+      this.segmentQueue = [];
+    }
 
     if (this.segmentQueue.length >= this.maxSegmentQueue) {
       this.segmentQueue.shift();
@@ -167,6 +321,15 @@ class GeminiLanguagePipeline extends EventEmitter {
   }
 
   async sendSegmentToGemini(segment) {
+    if (segment?.emittedAt && Date.now() - segment.emittedAt > this.maxSegmentAgeBeforeSendMs) {
+      this.stats.segmentsDroppedStaleBeforeSend += 1;
+      this.emit(
+        "warning",
+        `[${this.languageCode}] Dropping stale segment ${segment.segmentId} before Gemini send to stay realtime`
+      );
+      return;
+    }
+
     if (!this.geminiClient.canSendImmediately()) {
       this.stats.segmentsSkippedNoConnection += 1;
       const now = Date.now();
@@ -208,6 +371,8 @@ class GeminiLanguagePipeline extends EventEmitter {
       return;
     }
 
+    await this.waitForTurnCompletion(segment.segmentId);
+
     this.stats.segmentsSent += 1;
     this.emit("segment-sent", {
       languageCode: this.languageCode,
@@ -248,6 +413,11 @@ class GeminiLanguagePipeline extends EventEmitter {
   async stop() {
     this.closed = true;
     this.segmentQueue = [];
+    this.recentSegmentFingerprints = [];
+    if (this.pendingTurnCompletion) {
+      this.pendingTurnCompletion.resolve(false);
+      this.pendingTurnCompletion = null;
+    }
     await this.geminiClient.close();
     await this.ivsStreamer.stopStream();
     this.emit("stopped", { languageCode: this.languageCode });
