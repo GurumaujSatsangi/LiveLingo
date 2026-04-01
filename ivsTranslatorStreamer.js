@@ -38,7 +38,32 @@ class IVSTranslatorStreamer {
     this.nextSequenceToPlay = 1;
     this.autoSequenceCounter = 1;
     this.playbackTimer = null;
+    this.playbackCursorMs = 0;
+    this.maxFramesPerTick = Math.max(1, Number(options.maxFramesPerTick || process.env.IVS_MAX_FRAMES_PER_TICK || 8));
     this.currentChunk = null; // { seq, buffer, offset }
+    this.lastAcceptedChunk = null;
+    this.consecutiveDuplicateChunks = 0;
+    this.duplicateChunksDropped = 0;
+    this.nearDuplicateChunksDropped = 0;
+    this.maxConsecutiveDuplicateChunks = Math.max(
+      0,
+      Number(options.maxConsecutiveDuplicateChunks ?? process.env.IVS_MAX_CONSECUTIVE_DUPLICATE_CHUNKS ?? 0)
+    );
+    this.audioFingerprintDedupeEnabled =
+      String(options.audioFingerprintDedupeEnabled ?? process.env.IVS_AUDIO_FINGERPRINT_DEDUPE ?? "true").toLowerCase() !== "false";
+    this.fingerprintBinCount = Math.max(
+      8,
+      Number(options.fingerprintBinCount || process.env.IVS_FINGERPRINT_BIN_COUNT || 12)
+    );
+    this.fingerprintWindowMs = Math.max(
+      250,
+      Number(options.fingerprintWindowMs || process.env.IVS_FINGERPRINT_WINDOW_MS || 2500)
+    );
+    this.fingerprintSimilarityThreshold = Math.min(
+      0.9999,
+      Math.max(0.9, Number(options.fingerprintSimilarityThreshold || process.env.IVS_FINGERPRINT_SIMILARITY || 0.992))
+    );
+    this.recentFingerprints = [];
     this.inputSampleRate = Math.max(8000, Number(options.inputSampleRate || process.env.IVS_TRANSLATED_PCM_RATE || 16000));
     this.frameDurationMs = 20;
     this.frameBytes = Math.floor((this.inputSampleRate * 2 * this.frameDurationMs) / 1000);
@@ -139,6 +164,11 @@ class IVSTranslatorStreamer {
         );
         this.backgroundMusicWarned = true;
       }
+
+      // Keep a continuous bed even when the file is missing.
+      this.setFallbackAudio(this.buildSyntheticBackgroundPcm());
+      this.backgroundMusicLoaded = true;
+      console.log(`🎵 Using generated background bed for ${this.language.toUpperCase()} (file missing)`);
       return;
     }
 
@@ -158,7 +188,33 @@ class IVSTranslatorStreamer {
         console.warn(`⚠️  Failed to enable background music [${this.language}]: ${err.message}`);
         this.backgroundMusicWarned = true;
       }
+
+      // Fall back to a generated loop so output stays continuous.
+      this.setFallbackAudio(this.buildSyntheticBackgroundPcm());
+      this.backgroundMusicLoaded = true;
+      console.log(`🎵 Using generated background bed for ${this.language.toUpperCase()} (transcode fallback)`);
     }
+  }
+
+  buildSyntheticBackgroundPcm(durationSec = 30) {
+    const totalSamples = Math.max(1, Math.floor(this.inputSampleRate * durationSec));
+    const buffer = Buffer.alloc(totalSamples * 2);
+    const level = Math.max(0.04, this.backgroundMusicVolume);
+    const amplitude = Math.floor(2600 * level);
+
+    for (let i = 0; i < totalSamples; i += 1) {
+      const t = i / this.inputSampleRate;
+      const low = Math.sin(2 * Math.PI * 196 * t);
+      const mid = Math.sin(2 * Math.PI * 262 * t);
+      const shimmer = Math.sin(2 * Math.PI * 392 * t);
+      let sample = Math.round((low * 0.5 + mid * 0.35 + shimmer * 0.15) * amplitude);
+
+      if (sample > 32767) sample = 32767;
+      if (sample < -32768) sample = -32768;
+      buffer.writeInt16LE(sample, i * 2);
+    }
+
+    return buffer;
   }
 
   /**
@@ -416,9 +472,10 @@ class IVSTranslatorStreamer {
       return;
     }
 
+    this.playbackCursorMs = Date.now();
     this.playbackTimer = setInterval(() => {
       this.playbackTick();
-    }, this.frameDurationMs);
+    }, Math.max(5, Math.floor(this.frameDurationMs / 2)));
   }
 
   stopPlaybackLoop() {
@@ -429,6 +486,7 @@ class IVSTranslatorStreamer {
     this.currentChunk = null;
     this.waitingForDrain = false;
     this.missingSequenceSince = null;
+    this.playbackCursorMs = 0;
   }
 
   playbackTick() {
@@ -440,18 +498,38 @@ class IVSTranslatorStreamer {
       return;
     }
 
-    const translatedFrame = this.getNextTranslatedFrame();
-    const backgroundFrame = this.getBackgroundFrame();
-    const frame = translatedFrame
-      ? this.mixPcmFrames(translatedFrame, backgroundFrame)
-      : backgroundFrame;
-    const writeSuccess = this.ffmpeg.stdin.write(frame);
+    const now = Date.now();
+    if (!this.playbackCursorMs) {
+      this.playbackCursorMs = now;
+    }
 
-    if (!writeSuccess) {
-      this.waitingForDrain = true;
-      this.ffmpeg.stdin.once("drain", () => {
-        this.waitingForDrain = false;
-      });
+    const elapsedMs = Math.max(0, now - this.playbackCursorMs);
+    const framesDue = Math.max(1, Math.floor(elapsedMs / this.frameDurationMs));
+    const framesToWrite = Math.min(this.maxFramesPerTick, framesDue);
+
+    for (let i = 0; i < framesToWrite; i += 1) {
+      const translatedFrame = this.getNextTranslatedFrame();
+      const backgroundFrame = this.getBackgroundFrame();
+      const frame = translatedFrame
+        ? this.mixPcmFrames(translatedFrame, backgroundFrame)
+        : backgroundFrame;
+      const writeSuccess = this.ffmpeg.stdin.write(frame);
+
+      this.playbackCursorMs += this.frameDurationMs;
+
+      if (!writeSuccess) {
+        this.waitingForDrain = true;
+        this.ffmpeg.stdin.once("drain", () => {
+          this.waitingForDrain = false;
+        });
+        break;
+      }
+    }
+
+    // Avoid unbounded catch-up bursts if the event loop stalls for too long.
+    const maxBacklogMs = this.frameDurationMs * this.maxFramesPerTick;
+    if (now - this.playbackCursorMs > maxBacklogMs) {
+      this.playbackCursorMs = now - maxBacklogMs;
     }
   }
 
@@ -562,6 +640,121 @@ class IVSTranslatorStreamer {
     return frame;
   }
 
+  buildAudioFingerprint(buffer) {
+    if (!Buffer.isBuffer(buffer) || buffer.length < 160) {
+      return null;
+    }
+
+    const sampleCount = Math.floor(buffer.length / 2);
+    if (sampleCount <= 0) {
+      return null;
+    }
+
+    const bins = new Array(this.fingerprintBinCount).fill(0);
+    const counts = new Array(this.fingerprintBinCount).fill(0);
+    let squaredSum = 0;
+    let zeroCrossings = 0;
+    let previousSample = 0;
+
+    for (let i = 0; i < sampleCount; i += 1) {
+      const sample = buffer.readInt16LE(i * 2);
+      const normalized = sample / 32768;
+      const absValue = Math.abs(normalized);
+      const binIndex = Math.min(
+        this.fingerprintBinCount - 1,
+        Math.floor((i * this.fingerprintBinCount) / sampleCount)
+      );
+
+      bins[binIndex] += absValue;
+      counts[binIndex] += 1;
+      squaredSum += normalized * normalized;
+
+      if (i > 0 && ((sample >= 0 && previousSample < 0) || (sample < 0 && previousSample >= 0))) {
+        zeroCrossings += 1;
+      }
+
+      previousSample = sample;
+    }
+
+    for (let i = 0; i < bins.length; i += 1) {
+      if (counts[i] > 0) {
+        bins[i] /= counts[i];
+      }
+    }
+
+    const rms = Math.sqrt(squaredSum / sampleCount);
+    const zcr = sampleCount > 1 ? zeroCrossings / (sampleCount - 1) : 0;
+    return [...bins, rms, zcr];
+  }
+
+  cosineSimilarity(vectorA, vectorB) {
+    if (!vectorA || !vectorB || vectorA.length !== vectorB.length) {
+      return 0;
+    }
+
+    let dot = 0;
+    let normA = 0;
+    let normB = 0;
+
+    for (let i = 0; i < vectorA.length; i += 1) {
+      const a = vectorA[i];
+      const b = vectorB[i];
+      dot += a * b;
+      normA += a * a;
+      normB += b * b;
+    }
+
+    if (normA <= 0 || normB <= 0) {
+      return 0;
+    }
+
+    return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+  }
+
+  pruneOldFingerprints(nowMs) {
+    if (this.recentFingerprints.length === 0) {
+      return;
+    }
+
+    this.recentFingerprints = this.recentFingerprints.filter(
+      (entry) => nowMs - entry.at <= this.fingerprintWindowMs
+    );
+  }
+
+  shouldDropNearDuplicate(buffer, sequenceNumber) {
+    if (!this.audioFingerprintDedupeEnabled) {
+      return { drop: false, fingerprint: null };
+    }
+
+    const fingerprint = this.buildAudioFingerprint(buffer);
+    if (!fingerprint) {
+      return { drop: false, fingerprint: null };
+    }
+
+    const now = Date.now();
+    this.pruneOldFingerprints(now);
+
+    let bestSimilarity = 0;
+    for (const entry of this.recentFingerprints) {
+      const similarity = this.cosineSimilarity(fingerprint, entry.fingerprint);
+      if (similarity > bestSimilarity) {
+        bestSimilarity = similarity;
+      }
+    }
+
+    if (bestSimilarity >= this.fingerprintSimilarityThreshold) {
+      this.nearDuplicateChunksDropped += 1;
+      if (this.nearDuplicateChunksDropped <= 5 || this.nearDuplicateChunksDropped % 25 === 0) {
+        console.warn(
+          `⚠️  Dropping near-duplicate ${this.language.toUpperCase()} audio chunk seq=${sequenceNumber} similarity=${bestSimilarity.toFixed(4)}`
+        );
+      }
+      return { drop: true, fingerprint };
+    }
+
+    return { drop: false, fingerprint };
+  }
+
   /**
    * Queue a translated PCM audio chunk by sequence number.
    */
@@ -594,7 +787,37 @@ class IVSTranslatorStreamer {
       return false;
     }
 
+    // Prevent audible repeats when provider emits the exact same PCM chunk repeatedly.
+    if (this.lastAcceptedChunk && this.lastAcceptedChunk.length === buffer.length && this.lastAcceptedChunk.equals(buffer)) {
+      this.consecutiveDuplicateChunks += 1;
+      if (this.consecutiveDuplicateChunks > this.maxConsecutiveDuplicateChunks) {
+        this.duplicateChunksDropped += 1;
+        if (this.duplicateChunksDropped <= 5 || this.duplicateChunksDropped % 25 === 0) {
+          console.warn(
+            `⚠️  Dropping repeated ${this.language.toUpperCase()} audio chunk seq=${sequenceNumber} repeats=${this.consecutiveDuplicateChunks}`
+          );
+        }
+        return false;
+      }
+    } else {
+      this.consecutiveDuplicateChunks = 0;
+    }
+
+    const nearDuplicateCheck = this.shouldDropNearDuplicate(buffer, sequenceNumber);
+    if (nearDuplicateCheck.drop) {
+      return false;
+    }
+
     this.pendingChunks.set(sequenceNumber, buffer);
+    this.lastAcceptedChunk = Buffer.from(buffer);
+    if (nearDuplicateCheck.fingerprint) {
+      this.recentFingerprints.push({
+        at: Date.now(),
+        seq: sequenceNumber,
+        fingerprint: nearDuplicateCheck.fingerprint,
+      });
+      this.pruneOldFingerprints(Date.now());
+    }
     return true;
   }
 
@@ -678,6 +901,8 @@ class IVSTranslatorStreamer {
       estimatedBufferDurationMs: bufferDurationMs,
       nextSequenceToPlay: stats.nextSequenceToPlay,
       isWaitingForDrain: this.waitingForDrain,
+      duplicateChunksDropped: this.duplicateChunksDropped,
+      nearDuplicateChunksDropped: this.nearDuplicateChunksDropped,
       fps: Math.round(1000 / this.frameDurationMs),
       bytesPerSecond: this.inputSampleRate * 2,
       language: this.language,
@@ -738,6 +963,9 @@ class IVSTranslatorStreamer {
     this.stopPlaybackLoop();
     this.pendingChunks.clear();
     this.currentChunk = null;
+    this.lastAcceptedChunk = null;
+    this.consecutiveDuplicateChunks = 0;
+    this.recentFingerprints = [];
 
     if (this.ffmpeg && !this.ffmpeg.killed) {
       try {
