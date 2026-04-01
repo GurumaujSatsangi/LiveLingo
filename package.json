@@ -4,8 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "start": "node index.js",
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start:gemini-live": "node gemini-live-ivs.js"
+    "start:gemini-live": "node index.js"
   },
   "keywords": [],
   "author": "",
