@@ -268,7 +268,7 @@ app.post("/orchestrator/stop", async (req, res) => {
 httpServer.listen(PORT, async () => {
   console.log(`${nowIso()} [http] UI server listening on http://localhost:${PORT}`);
 
-  const autoStart = String(process.env.AUTO_START_ORCHESTRATOR || "false").toLowerCase() === "true";
+  const autoStart = String(process.env.AUTO_START_ORCHESTRATOR || "true").toLowerCase() === "true";
   if (autoStart) {
     try {
       await startOrchestrator();
