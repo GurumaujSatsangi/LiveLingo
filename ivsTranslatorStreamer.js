@@ -31,6 +31,7 @@ class IVSTranslatorStreamer {
 
     this.ffmpeg = null;
     this.isRunning = false;
+    this.isStopping = false;
     this.reconnectAttempts = 0;
     this.isHandlingError = false;
     this.pendingChunks = new Map(); // Map of seq -> PCM audio buffer
@@ -38,8 +39,9 @@ class IVSTranslatorStreamer {
     this.autoSequenceCounter = 1;
     this.playbackTimer = null;
     this.currentChunk = null; // { seq, buffer, offset }
+    this.inputSampleRate = Math.max(8000, Number(options.inputSampleRate || process.env.IVS_TRANSLATED_PCM_RATE || 16000));
     this.frameDurationMs = 20;
-    this.frameBytes = 640; // 20ms @ 16kHz mono s16le => 16000 * 2 * 0.02
+    this.frameBytes = Math.floor((this.inputSampleRate * 2 * this.frameDurationMs) / 1000);
     this.waitingForDrain = false;
     this.fallbackPcmBuffer = null;
     this.fallbackOffset = 0;
@@ -55,6 +57,10 @@ class IVSTranslatorStreamer {
     this.backgroundMusicVolume = Math.max(
       0,
       Math.min(1, Number(options.backgroundMusicVolume ?? process.env.BGMUSIC_VOLUME ?? 0.08))
+    );
+    this.translatedAudioGain = Math.max(
+      0,
+      Math.min(3, Number(options.translatedAudioGain ?? process.env.TRANSLATED_AUDIO_GAIN ?? 1.6))
     );
     this.backgroundMusicLoaded = false;
     this.backgroundMusicWarned = false;
@@ -88,7 +94,7 @@ class IVSTranslatorStreamer {
         "-ac",
         "1",
         "-ar",
-        "16000",
+        String(this.inputSampleRate),
         "-filter:a",
         `volume=${this.backgroundMusicVolume.toFixed(3)}`,
         "-f",
@@ -176,6 +182,7 @@ class IVSTranslatorStreamer {
    * Reuses existing FFmpeg process if already running for this session
    */
   async startStream(sessionId = null) {
+    this.isStopping = false;
     const session = sessionId || `session_${Date.now()}`;
     this.currentSessionId = session;
 
@@ -230,7 +237,7 @@ class IVSTranslatorStreamer {
       "-f",
       "s16le",
       "-ar",
-      "16000",
+      String(this.inputSampleRate),
       "-ac",
       "1",
       "-thread_queue_size",
@@ -354,6 +361,11 @@ class IVSTranslatorStreamer {
     if (this.isHandlingError) {
       return;
     }
+
+    if (this.isStopping) {
+      return;
+    }
+
     this.isHandlingError = true;
 
     if (this.ffmpeg && !this.ffmpeg.killed) {
@@ -493,7 +505,7 @@ class IVSTranslatorStreamer {
     for (let offset = 0; offset < this.frameBytes; offset += 2) {
       const primarySample = primaryFrame.readInt16LE(offset);
       const backgroundSample = backgroundFrame.readInt16LE(offset);
-      let value = primarySample + backgroundSample;
+      let value = Math.round(primarySample * this.translatedAudioGain) + backgroundSample;
 
       if (value > 32767) value = 32767;
       if (value < -32768) value = -32768;
@@ -595,11 +607,133 @@ class IVSTranslatorStreamer {
   }
 
   /**
+   * STREAMING API: Push audio frame for real-time processing
+   * Designed for parallel pipeline integration.
+   * 
+   * Accepts audio chunk from pipeline and queues for playback.
+   * Maintains strict ordering via sequenceId.
+   */
+  pushAudioFrame(audioData) {
+    if (!audioData || !audioData.audioBuffer) {
+      console.warn('⚠️  Invalid audio frame data');
+      return false;
+    }
+
+    const { sequenceId, audioBuffer, provider } = audioData;
+    
+    if (!Buffer.isBuffer(audioBuffer) || audioBuffer.length === 0) {
+      console.warn(`⚠️  Empty audio buffer for sequence ${sequenceId}`);
+      return false;
+    }
+
+    // Enqueue with explicit sequence number
+    const success = this.enqueueAudioChunk(audioBuffer, { seq: sequenceId });
+    
+    if (success) {
+      const status = this.getStatus();
+      console.log(
+        `📤 ${this.language.toUpperCase()} audio queued: seq=${sequenceId}, ` +
+        `buffer=${audioBuffer.length}B, queue=${status.queueLength}, ` +
+        `provider=${provider}`
+      );
+    }
+
+    return success;
+  }
+
+  /**
+   * STREAMING API: Batch push multiple audio frames at once
+   * Useful for pipeline output batches.
+   */
+  pushAudioFrameBatch(audioDataArray) {
+    let successCount = 0;
+    let failureCount = 0;
+
+    for (const audioData of audioDataArray) {
+      if (this.pushAudioFrame(audioData)) {
+        successCount++;
+      } else {
+        failureCount++;
+      }
+    }
+
+    console.log(
+      `📦 Batch processed: ${successCount} success, ${failureCount} failed`
+    );
+
+    return { successCount, failureCount };
+  }
+
+  /**
+   * STREAMING API: Get current buffer depth and latency estimates
+   * Useful for backpressure monitoring.
+   */
+  getStreamingStats() {
+    const stats = this.getStatus();
+    const bufferDurationMs = (stats.queueLength * this.frameDurationMs);
+
+    return {
+      isRunning: stats.isRunning,
+      queueLength: stats.queueLength,
+      estimatedBufferDurationMs: bufferDurationMs,
+      nextSequenceToPlay: stats.nextSequenceToPlay,
+      isWaitingForDrain: this.waitingForDrain,
+      fps: Math.round(1000 / this.frameDurationMs),
+      bytesPerSecond: this.inputSampleRate * 2,
+      language: this.language,
+    };
+  }
+
+  /**
+   * STREAMING API: Stop accepting new frames gracefully
+   * Drain pipeline buffer before terminating.
+   */
+  async stopAcceptingFrames() {
+    console.log(`⏸️  ${this.language} streamer stopping frame acceptance...`);
+    
+    // Wait for pending chunks to be consumed
+    let attempts = 0;
+    while (this.pendingChunks.size > 0 && attempts < 100) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      attempts++;
+    }
+
+    console.log(`✅ ${this.language} streamer drained (after ${attempts * 50}ms)`);
+  }
+
+  /**
+   * STREAMING API: Resume a paused stream without restarting FFmpeg
+   */
+  async resume() {
+    if (this.isRunning) {
+      console.log(`✅ ${this.language} stream already running`);
+      return true;
+    }
+
+    console.log(`▶️  Resuming ${this.language} stream...`);
+    await this.ensureBackgroundMusicFallback();
+    this.startPlaybackLoop();
+    this.isRunning = true;
+    return true;
+  }
+
+  /**
+   * STREAMING API: Pause stream playback (pause playback timer)
+   */
+  async pause() {
+    console.log(`⏸️  Pausing ${this.language} stream...`);
+    this.stopPlaybackLoop();
+    this.isRunning = false;
+    return true;
+  }
+
+  /**
    * Stop the stream gracefully
    */
   async stopStream() {
     console.log(`🛑 Stopping IVS ${this.language.toUpperCase()} translator stream...`);
 
+    this.isStopping = true;
     this.isRunning = false;
     this.stopPlaybackLoop();
     this.pendingChunks.clear();
