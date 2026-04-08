@@ -5,6 +5,7 @@
 <meta content="width=device-width, initial-scale=1.0" name="viewport"/>
 <title>LiveLingo - Real-time Translation SPA</title>
 <script type="module" src="https://cdn.jsdelivr.net/npm/@videojs/html/cdn/video-minimal.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.18/dist/hls.min.js"></script>
 <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
 <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;700;800&amp;family=Inter:wght@300;400;500;600&amp;display=swap" rel="stylesheet"/>
 <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
@@ -130,29 +131,18 @@ data-webrtc-whep-urls='<%- JSON.stringify(webrtcWhepUrls || {}) %>'>
 </div>
 <!-- Central Player -->
 <div id="player-shell" class="relative h-[260px] sm:h-[380px] lg:h-[520px] bg-black rounded-xl overflow-hidden shadow-2xl group ring-1 ring-black/5">
-<!--
-  The PlayerProvider passes state between the UI components
-  and Media, and makes fully custom UIs possible.
-  It does not have layout by default (display:contents)
- -->
-<video-player>
-  <!--
-    Skins contain the entire player UI and are easily swappable.
-    They can each be "ejected" for full control and customization
-    of UI components.
-   -->
-  <video-minimal-skin>
-    <!--
-      Media are players without UIs, handling networking
-      and display of the media. They are easily swappable
-      to handle different sources.
-    -->
-                                <video id="live-video-player" class="w-full h-full" src="<%= streamUrls[initialLanguage] %>" playsinline controls autoplay muted preload="auto">
-                    <source id="live-video-source" src="<%= streamUrls[initialLanguage] %>" type="application/x-mpegURL">
-                </video>
-                <audio id="webrtc-audio-player" autoplay playsinline></audio>
-  </video-minimal-skin>
-</video-player><!-- Video Overlay UI -->
+<video
+    id="live-video-player"
+    class="w-full h-full object-contain bg-black"
+    src="<%= streamUrls[initialLanguage] %>"
+    playsinline
+    controls
+    autoplay
+    muted
+    preload="auto"
+></video>
+<audio id="webrtc-audio-player" autoplay playsinline></audio>
+<!-- Video Overlay UI -->
 
 <div id="stream-status" class="absolute inset-0 flex items-center justify-center bg-black/75 text-white text-center px-6">
 <p class="text-base sm:text-lg font-semibold tracking-wide">Stream is not live.</p>
@@ -190,13 +180,17 @@ data-stream-url="<%= streamUrls[option.language] || '' %>">
         const webrtcWhepUrls = JSON.parse(document.body.dataset.webrtcWhepUrls || "{}");
         const useWebrtcTranslatedAudio = "<%= String(useWebrtcTranslatedAudio) %>" === "true";
         const player = document.getElementById("live-video-player");
-        const playerSource = document.getElementById("live-video-source");
         const streamStatus = document.getElementById("stream-status");
         const webrtcAudioPlayer = document.getElementById("webrtc-audio-player");
         const activeListeners = document.getElementById("active-listeners-count");
         const options = Array.from(document.querySelectorAll(".stream-option"));
         let webrtcPeerConnection = null;
         let activeWebrtcLanguage = null;
+        let hlsInstance = null;
+        const webrtcTrackTimeoutMs = 3500;
+        let liveMonitorTimer = null;
+        let lastPlaybackSecond = -1;
+        let lastProgressAt = 0;
 
         const selectedClasses = ["border-2", "border-primary", "bg-white"];
         const unselectedClasses = ["border", "border-outline-variant", "bg-surface-container-low"];
@@ -240,27 +234,123 @@ data-stream-url="<%= streamUrls[option.language] || '' %>">
             streamStatus.style.display = isLive ? "none" : "flex";
         }
 
+        function markPlaybackProgress() {
+            if (!player) return;
+            const currentSecond = Math.floor(Number(player.currentTime || 0));
+            if (currentSecond !== lastPlaybackSecond || player.readyState >= 3) {
+                lastPlaybackSecond = currentSecond;
+                lastProgressAt = Date.now();
+                setLiveStatus(true);
+            }
+        }
+
+        function evaluateLiveStatus() {
+            if (!player) return;
+            const hasSource = Boolean(player.currentSrc || player.src);
+            if (!hasSource) {
+                setLiveStatus(false);
+                return;
+            }
+
+            if (player.ended) {
+                setLiveStatus(false);
+                return;
+            }
+
+            const now = Date.now();
+            const hasBufferedData = player.readyState >= 2;
+            const hasRecentProgress = lastProgressAt > 0 && now - lastProgressAt < 12000;
+            const isActivelyPlaying = !player.paused && !player.seeking && hasBufferedData;
+
+            setLiveStatus(isActivelyPlaying || hasRecentProgress);
+        }
+
+        function resetLiveMonitor() {
+            lastPlaybackSecond = -1;
+            lastProgressAt = 0;
+            if (liveMonitorTimer) {
+                clearInterval(liveMonitorTimer);
+            }
+            liveMonitorTimer = setInterval(evaluateLiveStatus, 1500);
+            evaluateLiveStatus();
+        }
+
+        function destroyHls() {
+            if (!hlsInstance) return;
+            hlsInstance.destroy();
+            hlsInstance = null;
+        }
+
+        function canUseNativeHls(videoElement) {
+            if (!videoElement || typeof videoElement.canPlayType !== "function") {
+                return false;
+            }
+            return Boolean(
+                videoElement.canPlayType("application/vnd.apple.mpegurl") ||
+                videoElement.canPlayType("application/x-mpegURL")
+            );
+        }
+
+        function wireHlsToPlayer(source) {
+            if (!player) return false;
+
+            const hasM3u8 = /\.m3u8($|[?#])/i.test(source);
+            const shouldUseHlsJs = hasM3u8 && window.Hls && window.Hls.isSupported() && !canUseNativeHls(player);
+
+            if (!shouldUseHlsJs) {
+                player.src = source;
+                player.load();
+                return true;
+            }
+
+            hlsInstance = new window.Hls({
+                enableWorker: true,
+                lowLatencyMode: true,
+                backBufferLength: 90,
+            });
+
+            hlsInstance.attachMedia(player);
+            hlsInstance.on(window.Hls.Events.MEDIA_ATTACHED, () => {
+                hlsInstance.loadSource(source);
+            });
+
+            hlsInstance.on(window.Hls.Events.ERROR, (_event, data) => {
+                if (!data || !data.fatal) return;
+
+                if (data.type === window.Hls.ErrorTypes.NETWORK_ERROR) {
+                    hlsInstance.startLoad();
+                    return;
+                }
+
+                if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR) {
+                    hlsInstance.recoverMediaError();
+                    return;
+                }
+
+                destroyHls();
+                setLiveStatus(false);
+            });
+
+            return true;
+        }
+
         function setPlayerSource(url, language) {
             if (!player) return false;
 
             const source = String(url || "").trim();
+            destroyHls();
+
             if (!source) {
                 setLiveStatus(false);
                 player.removeAttribute("src");
-                if (playerSource) {
-                    playerSource.removeAttribute("src");
-                }
                 player.load();
                 return false;
             }
 
             player.setAttribute("data-active-language", language);
-            player.setAttribute("src", source);
-            if (playerSource) {
-                playerSource.setAttribute("src", source);
-            }
-            player.load();
-            return true;
+            player.controls = true;
+            resetLiveMonitor();
+            return wireHlsToPlayer(source);
         }
 
         function waitForIceGatheringComplete(peerConnection, timeoutMs = 3000) {
@@ -324,12 +414,24 @@ data-stream-url="<%= streamUrls[option.language] || '' %>">
                     iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
                 });
 
+                let receivedTrack = false;
+                let trackResolve;
+                const trackPromise = new Promise((resolve) => {
+                    trackResolve = resolve;
+                });
+                const trackTimeout = setTimeout(() => {
+                    trackResolve(false);
+                }, webrtcTrackTimeoutMs);
+
                 peerConnection.addTransceiver("audio", { direction: "recvonly" });
                 peerConnection.addEventListener("track", (event) => {
                     const [stream] = event.streams || [];
                     if (!stream) return;
+                    receivedTrack = true;
+                    clearTimeout(trackTimeout);
                     webrtcAudioPlayer.srcObject = stream;
                     webrtcAudioPlayer.play().catch(() => {});
+                    trackResolve(true);
                 });
 
                 const offer = await peerConnection.createOffer({
@@ -353,6 +455,13 @@ data-stream-url="<%= streamUrls[option.language] || '' %>">
 
                 const answerSdp = await response.text();
                 await peerConnection.setRemoteDescription({ type: "answer", sdp: answerSdp });
+
+                const trackReady = await trackPromise;
+                if (!trackReady || !receivedTrack) {
+                    peerConnection.close();
+                    stopWebrtcAudio();
+                    return false;
+                }
 
                 webrtcPeerConnection = peerConnection;
                 activeWebrtcLanguage = language;
@@ -383,7 +492,13 @@ data-stream-url="<%= streamUrls[option.language] || '' %>">
 
             // Default behavior keeps translated stream audio/video from the same media URL for lip-sync.
             if (playerReady && useWebrtcTranslatedAudio && language !== "original") {
-                await startWebrtcAudio(language);
+                const webrtcStarted = await startWebrtcAudio(language);
+                if (!webrtcStarted) {
+                    stopWebrtcAudio();
+                    if (player) {
+                        player.muted = false;
+                    }
+                }
             } else {
                 stopWebrtcAudio();
                 if (player) {
@@ -407,10 +522,13 @@ data-stream-url="<%= streamUrls[option.language] || '' %>">
         });
 
         if (player) {
-            player.addEventListener("playing", () => setLiveStatus(true));
-            player.addEventListener("canplay", () => setLiveStatus(true));
-            player.addEventListener("error", () => setLiveStatus(false));
-            player.addEventListener("stalled", () => setLiveStatus(false));
+            player.addEventListener("loadeddata", markPlaybackProgress);
+            player.addEventListener("canplay", markPlaybackProgress);
+            player.addEventListener("playing", markPlaybackProgress);
+            player.addEventListener("timeupdate", markPlaybackProgress);
+            player.addEventListener("waiting", evaluateLiveStatus);
+            player.addEventListener("stalled", evaluateLiveStatus);
+            player.addEventListener("error", evaluateLiveStatus);
             player.addEventListener("ended", () => setLiveStatus(false));
         }
 

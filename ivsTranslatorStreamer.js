@@ -89,6 +89,8 @@ class IVSTranslatorStreamer {
     );
     this.backgroundMusicLoaded = false;
     this.backgroundMusicWarned = false;
+    this.liveKitAudioTask = null;
+    this.liveKitAudioTaskToken = 0;
 
     console.log(`🎯 IVS Translator Streamer initialized for: ${this.language.toUpperCase()}`);
   }
@@ -830,6 +832,81 @@ class IVSTranslatorStreamer {
   }
 
   /**
+   * LiveKit integration: accepts translated PCM16LE from a subscribed LiveKit audio track.
+   * Keeps compatibility with the existing queue/playback loop used by FFmpeg stdin.
+   */
+  ingestLiveKitPcm(buffer, options = {}) {
+    if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
+      return false;
+    }
+
+    if (this.isStopping) {
+      return false;
+    }
+
+    return this.enqueueAudioChunk(buffer, options);
+  }
+
+  /**
+   * Subscribe to a LiveKit remote audio track and continuously ingest PCM frames.
+   * The track frames are converted into Buffer chunks and queued into existing playout logic.
+   */
+  async subscribeToLiveKitTrack(track, options = {}) {
+    if (!track) {
+      console.warn(`⚠️  Cannot subscribe LiveKit track for ${this.language}: empty track`);
+      return false;
+    }
+
+    const { AudioStream } = await import("@livekit/rtc-node");
+    const sampleRate = Number(options.sampleRate || 24000);
+    const numChannels = Number(options.numChannels || 1);
+    let seq = Number(options.startSeq || this.autoSequenceCounter || 1);
+    const subscriptionToken = ++this.liveKitAudioTaskToken;
+
+    if (this.liveKitAudioTask) {
+      this.liveKitAudioTaskToken += 1;
+      this.liveKitAudioTask = null;
+    }
+
+    const stream = new AudioStream(track, {
+      sampleRate,
+      numChannels,
+    });
+
+    this.liveKitAudioTask = (async () => {
+      try {
+        for await (const audioFrame of stream) {
+          if (this.isStopping) {
+            break;
+          }
+
+          if (subscriptionToken !== this.liveKitAudioTaskToken) {
+            break;
+          }
+
+          const data = audioFrame?.data;
+          if (!data) {
+            continue;
+          }
+
+          const pcm = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+          this.ingestLiveKitPcm(Buffer.from(pcm), { seq });
+          seq += 1;
+        }
+      } catch (err) {
+        console.warn(`⚠️  LiveKit audio stream error [${this.language}]: ${err.message}`);
+      }
+    })();
+
+    return true;
+  }
+
+  stopLiveKitTrackSubscription() {
+    this.liveKitAudioTaskToken += 1;
+    this.liveKitAudioTask = null;
+  }
+
+  /**
    * STREAMING API: Push audio frame for real-time processing
    * Designed for parallel pipeline integration.
    * 
@@ -960,6 +1037,7 @@ class IVSTranslatorStreamer {
 
     this.isStopping = true;
     this.isRunning = false;
+    this.stopLiveKitTrackSubscription();
     this.stopPlaybackLoop();
     this.pendingChunks.clear();
     this.currentChunk = null;
