@@ -20,10 +20,10 @@ import os
 import sys
 from dataclasses import dataclass
 
-from livekit.agents import Agent, AgentSession, JobContext, JobRequest, WorkerOptions, cli
+from livekit.agents import AutoSubscribe, JobContext, JobRequest, WorkerOptions, cli
 from livekit.plugins.openai.realtime import RealtimeModel
-from livekit.plugins.silero import VAD
-
+from livekit.agents.multimodal import MultimodalAgent
+from livekit.plugins import silero
 
 SILICONFLOW_BASE_URL = "https://api.siliconflow.cn/v1"
 SILICONFLOW_MODEL = "qwen3.5-omni-flash"
@@ -43,12 +43,6 @@ def build_system_instruction(target_language: str) -> str:
         "Preserve the emotion but keep it concise for a livestream. "
         "Output translated speech only, no commentary or assistant behavior."
     )
-
-
-class TranslationLaneAgent(Agent):
-    def __init__(self, target_language: str, llm=None):
-        super().__init__(instructions=build_system_instruction(target_language), llm=llm)
-        self.target_language = target_language
 
 
 def parse_args() -> argparse.Namespace:
@@ -99,17 +93,11 @@ async def entrypoint(ctx: JobContext):
         model=SILICONFLOW_MODEL,
         modalities=["audio", "text"],
         temperature=0.1,
+        instructions=build_system_instruction(cfg.target_language),
     )
 
-    session = AgentSession(
-        llm=model,
-        vad=VAD.load(),
-        allow_interruptions=False,
-        turn_detection=None,
-    )
-
-    agent = TranslationLaneAgent(cfg.target_language)
-    await session.start(agent=agent, room=ctx.room)
+    agent = MultimodalAgent(model=model)
+    agent.start(ctx.room)
 
     room_disconnected = asyncio.Future[None]()
 

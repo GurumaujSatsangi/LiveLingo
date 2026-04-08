@@ -143,6 +143,7 @@ class LiveKitSiliconOrchestrator extends EventEmitter {
     this.useSourceVideoForTranslated =
       String(options.useSourceVideoForTranslated ?? process.env.IVS_TRANSLATED_USE_SOURCE_VIDEO ?? "false").toLowerCase() ===
       "true";
+    this.ffmpegThreadQueueSize = Number(options.ffmpegThreadQueueSize || process.env.FFMPEG_THREAD_QUEUE_SIZE || 4096);
 
     this.ingester = new StreamingAudioIngester({
       hlsUrl: this.hlsUrl,
@@ -151,6 +152,7 @@ class LiveKitSiliconOrchestrator extends EventEmitter {
       retainBuffer: false,
       maxRestartAttempts: Number(process.env.LIVEKIT_INGESTER_MAX_RESTARTS || 50),
       restartDelay: Number(process.env.LIVEKIT_INGESTER_RESTART_DELAY_MS || 1500),
+      ffmpegThreadQueueSize: this.ffmpegThreadQueueSize,
     });
 
     this.vadSegmenter = new VadSegmenter({
@@ -303,27 +305,14 @@ class LiveKitSiliconOrchestrator extends EventEmitter {
 
     this.laneRooms.set(lane.languageCode, room);
 
-    room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
-      if (track.kind !== TrackKind.KIND_AUDIO) return;
-      if (participant?.identity === room.localParticipant?.identity) return;
-
-      const trackSid = publication?.trackSid || publication?.sid || track?.sid;
-      const alreadySubscribedSid = this.laneSubscribedTrackSid.get(lane.languageCode);
-      if (alreadySubscribedSid && trackSid && alreadySubscribedSid === trackSid) {
-        return;
+    room.on(RoomEvent.TrackSubscribed, async (track, publication, participant) => {
+      if (participant && participant.identity.includes('agent') && track.kind === TrackKind.KIND_AUDIO) {
+        console.log(`🔊 Subscribing lane ${lane.languageCode} streamer to AI Agent track`);
+        const streamer = this.laneStreamers.get(lane.languageCode);
+        if (streamer) {
+          await streamer.subscribeToLiveKitTrack(track, { sampleRate: 24000 });
+        }
       }
-
-      if (trackSid) {
-        this.laneSubscribedTrackSid.set(lane.languageCode, trackSid);
-      }
-
-      this.emit("warning", `Subscribed translated track lane=${lane.languageCode} identity=${participant.identity}`);
-      streamer.subscribeToLiveKitTrack(track, {
-        sampleRate: 24000,
-        numChannels: 1,
-      }).catch((err) => {
-        this.emit("error", new Error(`Track consume failed lane=${lane.languageCode}: ${err.message}`));
-      });
     });
 
     room.on(RoomEvent.Disconnected, () => {
@@ -352,6 +341,7 @@ class LiveKitSiliconOrchestrator extends EventEmitter {
       inputSampleRate: 24000,
       videoSyncDelaySec: Number(process.env.VIDEO_SYNC_DELAY_SEC || 0),
       maxMissingSequenceWaitMs: Number(process.env.IVS_MAX_MISSING_SEQUENCE_WAIT_MS || 120),
+      ffmpegThreadQueueSize: this.ffmpegThreadQueueSize,
     });
 
     try {
@@ -436,6 +426,9 @@ class LiveKitSiliconOrchestrator extends EventEmitter {
       stdio: ["ignore", "pipe", "pipe"],
       env: {
         ...process.env,
+        LIVEKIT_URL: this.livekitUrl,
+        LIVEKIT_API_KEY: this.livekitApiKey,
+        LIVEKIT_API_SECRET: this.livekitApiSecret,
         PYTHONUNBUFFERED: "1",
         WORKER_PORT: String(workerPort),
       },

@@ -28,6 +28,7 @@ class IVSTranslatorStreamer {
 
     this.maxReconnectAttempts = options.maxReconnectAttempts || 5;
     this.reconnectDelay = options.reconnectDelay || 3000;
+    this.ffmpegThreadQueueSize = Number(options.ffmpegThreadQueueSize || process.env.FFMPEG_THREAD_QUEUE_SIZE || 4096);
 
     this.ffmpeg = null;
     this.isRunning = false;
@@ -64,7 +65,7 @@ class IVSTranslatorStreamer {
       Math.max(0.9, Number(options.fingerprintSimilarityThreshold || process.env.IVS_FINGERPRINT_SIMILARITY || 0.992))
     );
     this.recentFingerprints = [];
-    this.inputSampleRate = Math.max(8000, Number(options.inputSampleRate || process.env.IVS_TRANSLATED_PCM_RATE || 16000));
+    this.inputSampleRate = Math.max(8000, Number(options.inputSampleRate || process.env.IVS_TRANSLATED_PCM_RATE || 24000));
     this.frameDurationMs = 20;
     this.frameBytes = Math.floor((this.inputSampleRate * 2 * this.frameDurationMs) / 1000);
     this.waitingForDrain = false;
@@ -89,6 +90,7 @@ class IVSTranslatorStreamer {
     );
     this.backgroundMusicLoaded = false;
     this.backgroundMusicWarned = false;
+    this.consecutivePacketCorruptWarnings = 0;
     this.liveKitAudioTask = null;
     this.liveKitAudioTaskToken = 0;
 
@@ -267,7 +269,7 @@ class IVSTranslatorStreamer {
     if (useSourceVideo) {
       ffmpegArgs.push(
         "-thread_queue_size",
-        "1024",
+        String(this.ffmpegThreadQueueSize),
         "-itsoffset",
         String(Math.max(0, this.videoSyncDelaySec)),
         "-fflags",
@@ -282,6 +284,10 @@ class IVSTranslatorStreamer {
         "1",
         "-reconnect_delay_max",
         "2",
+        "-analyzeduration",
+        "10M",
+        "-probesize",
+        "10M",
         "-i",
         this.sourceVideoUrl
       );
@@ -299,7 +305,7 @@ class IVSTranslatorStreamer {
       "-ac",
       "1",
       "-thread_queue_size",
-      "1024",
+      String(this.ffmpegThreadQueueSize),
       "-i",
       "pipe:0"
     );
@@ -390,8 +396,21 @@ class IVSTranslatorStreamer {
 
       this.ffmpeg.stderr.on("data", (data) => {
         const message = data.toString().trim();
+        if (!message) {
+          return;
+        }
+
+        const isPacketCorrupt = /packet\s+corrupt/i.test(message);
+        if (isPacketCorrupt) {
+          this.consecutivePacketCorruptWarnings += 1;
+          if (this.consecutivePacketCorruptWarnings <= 5) {
+            return;
+          }
+        } else {
+          this.consecutivePacketCorruptWarnings = 0;
+        }
+
         if (
-          message &&
           !message.includes("frame=") &&
           !message.includes("speed=") &&
           !message.includes("Last message repeated")
@@ -515,6 +534,21 @@ class IVSTranslatorStreamer {
       const frame = translatedFrame
         ? this.mixPcmFrames(translatedFrame, backgroundFrame)
         : backgroundFrame;
+
+      // Non-blocking write path: avoid piling onto FFmpeg stdin when it signals backpressure.
+      if (!this.ffmpeg.stdin.writable || this.ffmpeg.stdin.writableNeedDrain) {
+        if (translatedFrame && this.pendingChunks.size > 0) {
+          // Drop stale translated frame under sustained backpressure to keep output near-live.
+          this.playbackCursorMs += this.frameDurationMs;
+        }
+
+        this.waitingForDrain = true;
+        this.ffmpeg.stdin.once("drain", () => {
+          this.waitingForDrain = false;
+        });
+        break;
+      }
+
       const writeSuccess = this.ffmpeg.stdin.write(frame);
 
       this.playbackCursorMs += this.frameDurationMs;
@@ -577,6 +611,9 @@ class IVSTranslatorStreamer {
   }
 
   mixPcmFrames(primaryFrame, backgroundFrame) {
+    if (!primaryFrame || primaryFrame.length === 0) {
+      return backgroundFrame;
+    }
     if (!backgroundFrame || backgroundFrame.length === 0) {
       return primaryFrame;
     }

@@ -27,6 +27,7 @@ class StreamingAudioIngester extends EventEmitter {
     // Rolling buffer for PCM audio
     this.audioBuffer = Buffer.alloc(0);
     this.maxBufferSize = options.maxBufferSize || 256000; // ~8 seconds at 16kHz mono
+    this.ffmpegThreadQueueSize = Number(options.ffmpegThreadQueueSize || process.env.FFMPEG_THREAD_QUEUE_SIZE || 4096);
     
     // FFmpeg process
     this.ffmpegProcess = null;
@@ -64,6 +65,8 @@ class StreamingAudioIngester extends EventEmitter {
       '-live_start_index', '-1',
       '-fflags', '+nobuffer+fastseek',
       '-flags', 'low_delay',
+      '-probesize', '10M',
+      '-analyzeduration', '10M',
       '-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data',
       '-http_persistent', '1',
       '-http_multiple', '1',
@@ -71,6 +74,7 @@ class StreamingAudioIngester extends EventEmitter {
       '-reconnect_streamed', '1',
       '-reconnect_on_network_error', '1',
       '-reconnect_delay_max', '2',
+      '-thread_queue_size', String(this.ffmpegThreadQueueSize),
       '-i', this.hlsUrl,
       
       // Audio extraction
