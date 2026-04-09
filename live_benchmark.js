@@ -3,6 +3,7 @@ import path from 'path';
 import { spawn } from 'child_process';
 import axios from 'axios';
 import dotenv from 'dotenv';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import WebSocket from 'ws';
 import ffmpegPath from 'ffmpeg-static';
 import pkg from 'wavefile';
@@ -17,6 +18,9 @@ const INPUT_AUDIO_DIR = process.env.INPUT_AUDIO_DIR || './test_audio';
 const RESULTS_DIR = process.env.RESULTS_DIR || './benchmark_results';
 const BENCHMARK_CHUNK_MS = Math.max(500, Number(process.env.BENCHMARK_CHUNK_MS || 1200));
 const SARVAM_PARALLEL_REQUESTS = Math.max(1, Number(process.env.SARVAM_PARALLEL_REQUESTS || 2));
+const geminiTextClient = GEMINI_API_KEY && GEMINI_API_KEY !== 'your_gemini_api_key_here'
+    ? new GoogleGenerativeAI(GEMINI_API_KEY)
+    : null;
 
 if (!fs.existsSync(RESULTS_DIR)) {
     fs.mkdirSync(RESULTS_DIR, { recursive: true });
@@ -124,6 +128,51 @@ function saveSarvamAudioSegment({ filePath, segmentId, audioBuffer, sampleRate, 
     const wavPath = path.join(RESULTS_DIR, `${basename}_seg${segmentId}_sarvam_${ts}.wav`);
     fs.writeFileSync(wavPath, wavSarvam.toBuffer());
     return wavPath;
+}
+
+function containsDevanagari(text) {
+    return /[\u0900-\u097F]/.test(String(text || ''));
+}
+
+async function translateEnglishTranscriptToHindi(englishTranscript, segmentId) {
+    const trimmed = String(englishTranscript || '').trim();
+    if (!trimmed) {
+        return '';
+    }
+
+    if (containsDevanagari(trimmed)) {
+        return trimmed;
+    }
+
+    if (!geminiTextClient) {
+        return trimmed;
+    }
+
+    try {
+        const model = geminiTextClient.getGenerativeModel({ model: 'gemini-2.0-flash' });
+        const result = await model.generateContent(
+            `Translate the following English text into natural Hindi. Return only the Hindi text without quotes or commentary.\n\n${trimmed}`
+        );
+        const hindiText = result.response.text().trim();
+        if (hindiText) {
+            console.log(`[Path 2] Segment ${segmentId} -> Hindi transcript generated.`);
+            return hindiText;
+        }
+    } catch (err) {
+        console.warn(`\n[Path 2] Hindi translation fallback for segment ${segmentId}: ${err?.message || err}`);
+    }
+
+    return trimmed;
+}
+
+function computeNetworkSpeedMbps(transferredBytes, latencyMs) {
+    const bytes = Number(transferredBytes || 0);
+    const ms = Number(latencyMs || 0);
+    if (bytes <= 0 || ms <= 0) {
+        return 0;
+    }
+
+    return Number(((bytes * 8) / (ms / 1000) / 1_000_000).toFixed(3));
 }
 
 // ------------------------------------------------------------------
@@ -261,10 +310,14 @@ async function runGeminiPath(segmentId, audioBuffer, t1_start) {
 // Path 2: Sarvam Cascaded Implementation
 // ------------------------------------------------------------------
 async function runSarvamPath(segmentId, audioBuffer, t2_start) {
-    let transcript = "Simulated translated text."; // Default Mock
+    let englishTranscript = "Simulated translated text."; // Default Mock
+    let hindiTranscript = "सिम्युलेटेड अनुवादित पाठ।";
     let sttTime = 0;
+    let translationTime = 0;
     let audioOutputFormat = 'unknown';
     let audioSampleRate = 8000;
+    let sttInputBytes = 0;
+    let ttsOutputBytes = 0;
     
     // -- Step A: STT --
     const sttStartTime = Date.now();
@@ -276,6 +329,7 @@ async function runSarvamPath(segmentId, audioBuffer, t2_start) {
         const wav = new WaveFile();
         wav.fromScratch(1, 16000, '16', new Int16Array(audioBuffer.buffer, audioBuffer.byteOffset, audioBuffer.length / 2));
         const wavFileBuffer = wav.toBuffer();
+        sttInputBytes = wavFileBuffer.length;
 
         const formData = new FormData();
         formData.append('file', new Blob([wavFileBuffer]), 'chunk.wav');
@@ -287,8 +341,8 @@ async function runSarvamPath(segmentId, audioBuffer, t2_start) {
             const sttRes = await axios.post('https://api.sarvam.ai/speech-to-text-translate', formData, {
                 headers: { 'api-subscription-key': SARVAM_API_KEY }
             });
-            transcript = sttRes.data.transcript;
-            console.log(`[Path 2] Segment ${segmentId} -> Translated String: "${transcript}"`);
+            englishTranscript = String(sttRes.data?.transcript || '').trim();
+            console.log(`[Path 2] Segment ${segmentId} -> English transcript: "${englishTranscript}"`);
         } catch (e) {
              console.error(`\n[Path 2] Sarvam STT failed for ${segmentId}:`, e?.response?.data || e.message);
         }
@@ -300,9 +354,13 @@ async function runSarvamPath(segmentId, audioBuffer, t2_start) {
     const sttEndTime = Date.now();
     sttTime = sttEndTime - sttStartTime;
 
+    const translationStartTime = Date.now();
+    hindiTranscript = await translateEnglishTranscriptToHindi(englishTranscript, segmentId);
+    translationTime = Date.now() - translationStartTime;
+
     // Update Context History
-    if (transcript) {
-        sarvamContextHistory.push(transcript);
+    if (englishTranscript) {
+        sarvamContextHistory.push(englishTranscript);
         if (sarvamContextHistory.length > 5) sarvamContextHistory.shift(); 
     }
 
@@ -314,7 +372,7 @@ async function runSarvamPath(segmentId, audioBuffer, t2_start) {
     if (SARVAM_API_KEY && SARVAM_API_KEY !== 'your_sarvam_api_key_here') {
         try {
             const ttsRes = await axios.post('https://api.sarvam.ai/text-to-speech', {
-                inputs: [transcript],
+                inputs: [hindiTranscript],
                 target_language_code: 'hi-IN',
                 speaker: 'kabir',
                 pace: 1.0,
@@ -325,6 +383,7 @@ async function runSarvamPath(segmentId, audioBuffer, t2_start) {
                 headers: { 'api-subscription-key': SARVAM_API_KEY }
             });
             audioOutput = decodeSarvamAudioBase64(ttsRes.data?.audios?.[0]);
+            ttsOutputBytes = audioOutput.length;
             audioSampleRate = Number(ttsRes.data?.sample_rate || ttsRes.data?.sampleRate || 8000);
             audioOutputFormat = detectAudioFormat(audioOutput);
             console.log(`[Path 2] Segment ${segmentId} -> TTS generated ${ttsRes.data.audios[0].length} base64 chars for Hindi output.`);
@@ -338,17 +397,23 @@ async function runSarvamPath(segmentId, audioBuffer, t2_start) {
     const ttsEndTime = Date.now();
     ttsTime = ttsEndTime - ttsStartTime;
 
-    const p2_total = (sttEndTime - sttStartTime) + (ttsEndTime - ttsStartTime);
-    console.log(`[Path 2] Segment ${segmentId} -> Cascaded Done. (STT: ${sttTime}ms, TTS: ${ttsTime}ms)`);
+    const p2_total = (sttEndTime - sttStartTime) + translationTime + (ttsEndTime - ttsStartTime);
+    const networkMbps = computeNetworkSpeedMbps(sttInputBytes + ttsOutputBytes, sttTime + translationTime + ttsTime);
+    console.log(`[Path 2] Segment ${segmentId} -> Cascaded Done. (STT: ${sttTime}ms, Translate: ${translationTime}ms, TTS: ${ttsTime}ms)`);
 
     return {
         totalMs: p2_total,
-        transcript: transcript,
+        englishTranscript,
+        hindiTranscript,
         sttMs: sttTime,
+        translationMs: translationTime,
         ttsMs: ttsTime,
         audioBuffer: audioOutput,
         audioFormat: audioOutputFormat,
-        audioSampleRate
+        audioSampleRate,
+        sttInputBytes,
+        ttsOutputBytes,
+        networkMbps,
     };
 }
 
@@ -427,10 +492,13 @@ function processFile(filePath, isLastFile) {
                         file_name: path.basename(filePath),
                         segment_id: currentSegmentId,
                         chunk_ms: Math.round((segmentBuffer.length / (16000 * 2)) * 1000),
-                        sarvam_stt_ms: sarvamResult.sttMs,
-                        sarvam_tts_ms: sarvamResult.ttsMs,
-                        sarvam_total_ms: sarvamResult.totalMs,
-                        transcript: sarvamResult.transcript || '',
+                        english_transcript: sarvamResult.englishTranscript || '',
+                        hindi_transcript: sarvamResult.hindiTranscript || '',
+                        network_mbps: sarvamResult.networkMbps,
+                        stt_ms: sarvamResult.sttMs,
+                        translation_ms: sarvamResult.translationMs,
+                        tts_ms: sarvamResult.ttsMs,
+                        total_latency_ms: sarvamResult.totalMs,
                         saved_audio_path: savedAudioPath,
                         processed_at_iso: new Date().toISOString(),
                     });
