@@ -1,5 +1,7 @@
 node_modules
 .env
+.env.test
+*.docx
 
 # Local benchmark/test artifacts
 benchmark_results/

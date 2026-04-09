@@ -6,6 +6,7 @@ import dotenv from 'dotenv';
 import WebSocket from 'ws';
 import ffmpegPath from 'ffmpeg-static';
 import pkg from 'wavefile';
+import XLSX from 'xlsx';
 const { WaveFile } = pkg;
 
 dotenv.config({ path: '.env.test' });
@@ -14,6 +15,8 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const SARVAM_API_KEY = process.env.SARVAM_API_KEY;
 const INPUT_AUDIO_DIR = process.env.INPUT_AUDIO_DIR || './test_audio';
 const RESULTS_DIR = process.env.RESULTS_DIR || './benchmark_results';
+const BENCHMARK_CHUNK_MS = Math.max(500, Number(process.env.BENCHMARK_CHUNK_MS || 1200));
+const SARVAM_PARALLEL_REQUESTS = Math.max(1, Number(process.env.SARVAM_PARALLEL_REQUESTS || 2));
 
 if (!fs.existsSync(RESULTS_DIR)) {
     fs.mkdirSync(RESULTS_DIR, { recursive: true });
@@ -47,6 +50,80 @@ function printTableRow(segmentId, p1Ms, p2Ms) {
     const diff = p2Ms - p1Ms;
     const speedup = p1Ms > 0 ? (p2Ms / p1Ms).toFixed(2) : 'N/A';
     console.log(`| ${String(segmentId).padEnd(7)} | ${String(p1Ms).padEnd(16)} | ${String(p2Ms).padEnd(16)} | ${String(diff).padEnd(9)} | ${String(speedup + 'x').padEnd(7)} |`);
+}
+
+function decodeSarvamAudioBase64(maybeBase64) {
+    if (!maybeBase64 || typeof maybeBase64 !== 'string') {
+        return Buffer.alloc(0);
+    }
+
+    const cleanBase64 = maybeBase64.includes(',')
+        ? maybeBase64.slice(maybeBase64.indexOf(',') + 1)
+        : maybeBase64;
+
+    return Buffer.from(cleanBase64, 'base64');
+}
+
+function detectAudioFormat(audioBuffer) {
+    if (!Buffer.isBuffer(audioBuffer) || audioBuffer.length < 4) {
+        return 'unknown';
+    }
+
+    if (audioBuffer.slice(0, 4).toString('ascii') === 'RIFF' && audioBuffer.slice(8, 12).toString('ascii') === 'WAVE') {
+        return 'wav';
+    }
+
+    if (audioBuffer.slice(0, 3).toString('ascii') === 'ID3') {
+        return 'mp3';
+    }
+
+    if (audioBuffer.slice(0, 4).toString('ascii') === 'OggS') {
+        return 'ogg';
+    }
+
+    if (audioBuffer.slice(0, 4).toString('ascii') === 'fLaC') {
+        return 'flac';
+    }
+
+    if (audioBuffer[0] === 0xff && (audioBuffer[1] & 0xe0) === 0xe0) {
+        return 'mp3';
+    }
+
+    return 'pcm16le';
+}
+
+function saveSarvamAudioSegment({ filePath, segmentId, audioBuffer, sampleRate, explicitFormat }) {
+    const basename = path.parse(filePath).name;
+    const ts = Date.now();
+    const detectedFormat = explicitFormat && explicitFormat !== 'unknown' ? explicitFormat : detectAudioFormat(audioBuffer);
+
+    if (!Buffer.isBuffer(audioBuffer) || audioBuffer.length === 0) {
+        const emptyPath = path.join(RESULTS_DIR, `${basename}_seg${segmentId}_sarvam_${ts}.wav`);
+        const fallbackWav = new WaveFile();
+        fallbackWav.fromScratch(1, sampleRate || 8000, '16', new Int16Array(0));
+        fs.writeFileSync(emptyPath, fallbackWav.toBuffer());
+        return emptyPath;
+    }
+
+    if (detectedFormat === 'wav' || detectedFormat === 'mp3' || detectedFormat === 'ogg' || detectedFormat === 'flac') {
+        const outPath = path.join(RESULTS_DIR, `${basename}_seg${segmentId}_sarvam_${ts}.${detectedFormat}`);
+        fs.writeFileSync(outPath, audioBuffer);
+        return outPath;
+    }
+
+    const alignedLength = audioBuffer.length - (audioBuffer.length % 2);
+    const pcmSlice = audioBuffer.subarray(0, alignedLength);
+    const wavSarvam = new WaveFile();
+    wavSarvam.fromScratch(
+        1,
+        sampleRate || 8000,
+        '16',
+        new Int16Array(pcmSlice.buffer, pcmSlice.byteOffset, pcmSlice.length / 2)
+    );
+
+    const wavPath = path.join(RESULTS_DIR, `${basename}_seg${segmentId}_sarvam_${ts}.wav`);
+    fs.writeFileSync(wavPath, wavSarvam.toBuffer());
+    return wavPath;
 }
 
 // ------------------------------------------------------------------
@@ -186,6 +263,8 @@ async function runGeminiPath(segmentId, audioBuffer, t1_start) {
 async function runSarvamPath(segmentId, audioBuffer, t2_start) {
     let transcript = "Simulated translated text."; // Default Mock
     let sttTime = 0;
+    let audioOutputFormat = 'unknown';
+    let audioSampleRate = 8000;
     
     // -- Step A: STT --
     const sttStartTime = Date.now();
@@ -245,7 +324,9 @@ async function runSarvamPath(segmentId, audioBuffer, t2_start) {
             }, {
                 headers: { 'api-subscription-key': SARVAM_API_KEY }
             });
-            audioOutput = Buffer.from(ttsRes.data.audios[0], 'base64');
+            audioOutput = decodeSarvamAudioBase64(ttsRes.data?.audios?.[0]);
+            audioSampleRate = Number(ttsRes.data?.sample_rate || ttsRes.data?.sampleRate || 8000);
+            audioOutputFormat = detectAudioFormat(audioOutput);
             console.log(`[Path 2] Segment ${segmentId} -> TTS generated ${ttsRes.data.audios[0].length} base64 chars for Hindi output.`);
         } catch (e) {
              console.error(`\n[Path 2] Sarvam TTS failed for ${segmentId}:`, e?.response?.data || e.message);
@@ -265,7 +346,9 @@ async function runSarvamPath(segmentId, audioBuffer, t2_start) {
         transcript: transcript,
         sttMs: sttTime,
         ttsMs: ttsTime,
-        audioBuffer: audioOutput
+        audioBuffer: audioOutput,
+        audioFormat: audioOutputFormat,
+        audioSampleRate
     };
 }
 
@@ -280,6 +363,9 @@ function processFile(filePath, isLastFile) {
         let totalSttTimeMs = 0;
         let totalTtsTimeMs = 0;
         let totalProcessingMs = 0;
+        const segmentLatencyRows = [];
+        const queuedTasks = [];
+        const inFlight = new Set();
         
         // PCM s16le, 16kHz, mono
         const ffmpegProcess = spawn(ffmpegPath, [
@@ -295,7 +381,64 @@ function processFile(filePath, isLastFile) {
         let vadByteCount = 0;
         let segmentId = 1;
         
-        const VAD_SEGMENT_THRESHOLD = 16000 * 2 * 3; // Approx 3 seconds of 16kHz 16-bit audio per segment
+        const VAD_SEGMENT_THRESHOLD = Math.floor(16000 * 2 * (BENCHMARK_CHUNK_MS / 1000));
+
+        const enqueueSegmentTask = async (taskFactory) => {
+            while (inFlight.size >= SARVAM_PARALLEL_REQUESTS) {
+                await Promise.race(inFlight);
+            }
+
+            let taskPromise;
+            taskPromise = taskFactory().finally(() => {
+                inFlight.delete(taskPromise);
+            });
+
+            inFlight.add(taskPromise);
+            queuedTasks.push(taskPromise);
+        };
+
+        const scheduleSegment = async (segmentBuffer, currentSegmentId, startSignalMs) => {
+            await enqueueSegmentTask(async () => {
+                console.log(`\n[VAD Trigger] Emitted Segment ${currentSegmentId} (${segmentBuffer.length} bytes). Processing...`);
+
+                try {
+                    const sarvamResult = await runSarvamPath(currentSegmentId, segmentBuffer, startSignalMs);
+
+                    totalSttTimeMs += sarvamResult.sttMs;
+                    totalTtsTimeMs += sarvamResult.ttsMs;
+                    totalProcessingMs += sarvamResult.totalMs;
+
+                    console.table([{
+                        Segment: currentSegmentId,
+                        "Sarvam STT (ms)": sarvamResult.sttMs,
+                        "Sarvam TTS (ms)": sarvamResult.ttsMs,
+                        "Sarvam Total (ms)": sarvamResult.totalMs
+                    }]);
+
+                    const savedAudioPath = saveSarvamAudioSegment({
+                        filePath,
+                        segmentId: currentSegmentId,
+                        audioBuffer: sarvamResult.audioBuffer,
+                        sampleRate: sarvamResult.audioSampleRate,
+                        explicitFormat: sarvamResult.audioFormat,
+                    });
+
+                    segmentLatencyRows.push({
+                        file_name: path.basename(filePath),
+                        segment_id: currentSegmentId,
+                        chunk_ms: Math.round((segmentBuffer.length / (16000 * 2)) * 1000),
+                        sarvam_stt_ms: sarvamResult.sttMs,
+                        sarvam_tts_ms: sarvamResult.ttsMs,
+                        sarvam_total_ms: sarvamResult.totalMs,
+                        transcript: sarvamResult.transcript || '',
+                        saved_audio_path: savedAudioPath,
+                        processed_at_iso: new Date().toISOString(),
+                    });
+                } catch (err) {
+                    console.error(`\nError processing segment ${currentSegmentId}:`, err);
+                }
+            });
+        };
 
         printTableHeader();
 
@@ -313,41 +456,19 @@ function processFile(filePath, isLastFile) {
                         vadByteCount = 0;
                         
                         const startSignalMs = Date.now();
-                console.log(`\n[VAD Trigger] Emitted Segment ${currentSegmentId} (${completeAudioBuffer.length} bytes). Processing...`);
-
-                try {
-                    // const geminiPromise = runGeminiPath(currentSegmentId, completeAudioBuffer, startSignalMs);
-                    // const sarvamPromise = runSarvamPath(currentSegmentId, completeAudioBuffer, startSignalMs);
-                    // const [geminiResult, sarvamResult] = await Promise.all([geminiPromise, sarvamPromise]);
-                    const sarvamResult = await runSarvamPath(currentSegmentId, completeAudioBuffer, startSignalMs);
-
-                    totalSttTimeMs += sarvamResult.sttMs;
-                    totalTtsTimeMs += sarvamResult.ttsMs;
-                    totalProcessingMs += sarvamResult.totalMs;
-
-                    console.table([{
-                        Segment: currentSegmentId,
-                        "Sarvam STT (ms)": sarvamResult.sttMs,
-                        "Sarvam TTS (ms)": sarvamResult.ttsMs,
-                        "Sarvam Total (ms)": sarvamResult.totalMs
-                    }]);
-
-                    const ts = Date.now();
-                    const basename = path.parse(filePath).name;
-                    
-                    // const gemFinalAudio = Buffer.concat(geminiResult.audioChunks);
-                    // const wavGem = new WaveFile();
-                    // wavGem.fromScratch(1, 24000, '16', gemFinalAudio.length > 0 ? gemFinalAudio : Buffer.alloc(16000*2));
-                    // fs.writeFileSync(path.join(RESULTS_DIR, `${basename}_seg${currentSegmentId}_gemini_${ts}.wav`), wavGem.toBuffer());
-
-                    const wavSarvam = new WaveFile();
-                    wavSarvam.fromScratch(1, 8000, '16', sarvamResult.audioBuffer);
-                    fs.writeFileSync(path.join(RESULTS_DIR, `${basename}_seg${currentSegmentId}_sarvam_${ts}.wav`), wavSarvam.toBuffer());
-                        } catch (err) {
-                            console.error(`\nError processing segment ${currentSegmentId}:`, err);
-                        }
+                        await scheduleSegment(completeAudioBuffer, currentSegmentId, startSignalMs);
                     }
                 }
+
+                if (vadByteCount > 0 && vadBuffer.length > 0) {
+                    const finalSegmentId = segmentId++;
+                    const finalBuffer = Buffer.concat(vadBuffer);
+                    await scheduleSegment(finalBuffer, finalSegmentId, Date.now());
+                    vadBuffer = [];
+                    vadByteCount = 0;
+                }
+
+                await Promise.allSettled(queuedTasks);
                 
                 // End of stream reached
                 console.log(`\nZero-Disk Stream finished processing data for ${filePath}`);
@@ -358,14 +479,25 @@ function processFile(filePath, isLastFile) {
                     "Total STT Time (ms)": totalSttTimeMs,
                     "Total TTS Time (ms)": totalTtsTimeMs,
                     "Total Processing (ms)": totalProcessingMs,
-                    "File Wall Clock (ms)": fileWallClockTime
+                    "File Wall Clock (ms)": fileWallClockTime,
+                    "Chunk Size (ms)": BENCHMARK_CHUNK_MS,
+                    "Sarvam Parallel Requests": SARVAM_PARALLEL_REQUESTS,
                 }]);
                 
-                resolve();
+                resolve({
+                    filePath,
+                    rows: segmentLatencyRows,
+                    summary: {
+                        totalSttTimeMs,
+                        totalTtsTimeMs,
+                        totalProcessingMs,
+                        fileWallClockTime,
+                    },
+                });
 
             } catch (err) {
                 console.error("Error reading FFmpeg stream:", err);
-                resolve();
+                resolve({ filePath, rows: [], summary: null });
             }
         })();
 
@@ -390,9 +522,33 @@ async function startBenchmark() {
         console.warn(`\n[!] Warning: No audio files found in ${INPUT_AUDIO_DIR}.`);
         process.exit(1);
     }
+
+    const allRows = [];
     
     for (let i = 0; i < files.length; i++) {
-        await processFile(files[i], i === files.length - 1);
+        const result = await processFile(files[i], i === files.length - 1);
+        if (result?.rows?.length) {
+            allRows.push(...result.rows);
+        }
+    }
+
+    if (allRows.length > 0) {
+        allRows.sort((a, b) => {
+            if (a.file_name === b.file_name) {
+                return Number(a.segment_id) - Number(b.segment_id);
+            }
+            return String(a.file_name).localeCompare(String(b.file_name));
+        });
+
+        const workbook = XLSX.utils.book_new();
+        const worksheet = XLSX.utils.json_to_sheet(allRows);
+        XLSX.utils.book_append_sheet(workbook, worksheet, 'segment_latency');
+
+        const excelPath = path.join(RESULTS_DIR, `segment_latency_${Date.now()}.xlsx`);
+        XLSX.writeFile(workbook, excelPath);
+        console.log(`\n📊 Segment latency Excel saved to: ${excelPath}`);
+    } else {
+        console.log('\nℹ️ No segment latency rows to write to Excel.');
     }
     
     if (geminiWs && geminiWs.readyState === WebSocket.OPEN) {
