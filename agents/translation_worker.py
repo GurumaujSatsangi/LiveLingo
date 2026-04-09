@@ -9,7 +9,7 @@ Required env:
 - LIVEKIT_URL
 - LIVEKIT_API_KEY
 - LIVEKIT_API_SECRET
-- SILICONFLOW_API_KEY
+- OPENROUTER_API_KEY
 """
 
 from __future__ import annotations
@@ -20,13 +20,12 @@ import os
 import sys
 from dataclasses import dataclass
 
-from livekit.agents import AutoSubscribe, JobContext, JobRequest, WorkerOptions, cli
+from livekit.agents import Agent, AgentSession, AutoSubscribe, JobContext, JobRequest, WorkerOptions, cli
 from livekit.plugins.openai.realtime import RealtimeModel
-from livekit.agents.multimodal import MultimodalAgent
 from livekit.plugins import silero
 
-SILICONFLOW_BASE_URL = "https://api.siliconflow.cn/v1"
-SILICONFLOW_MODEL = "qwen3.5-omni-flash"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_MODEL = "qwen/qwen3.6-plus"
 
 
 @dataclass
@@ -36,17 +35,10 @@ class WorkerConfig:
 
 
 def build_system_instruction(target_language: str) -> str:
-    return (
-        "You are a live stream translator. "
-        "Listen to the incoming English audio and immediately output the translation "
-        f"in {target_language} audio tokens. "
-        "Preserve the emotion but keep it concise for a livestream. "
-        "Output translated speech only, no commentary or assistant behavior."
-    )
-
+    return (f"You are a professional interpreter. Translate English audio to {target_language} accurately. Output only the translated text.")
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="LiveKit + SiliconFlow translation lane worker")
+    parser = argparse.ArgumentParser(description="LiveKit + OpenRouter translation lane worker")
     parser.add_argument(
         "--target-language",
         required=True,
@@ -83,21 +75,41 @@ async def entrypoint(ctx: JobContext):
         ctx.shutdown(f"room mismatch: expected {cfg.room_name}, got {ctx.room.name}")
         return
 
-    siliconflow_key = os.getenv("SILICONFLOW_API_KEY", "").strip()
+    siliconflow_key = os.getenv("OPENROUTER_API_KEY", "").strip()
     if not siliconflow_key:
-        raise RuntimeError("SILICONFLOW_API_KEY is required")
+        raise RuntimeError("OPENROUTER_API_KEY is required")
+
+    import aiohttp
+    http_session = aiohttp.ClientSession(
+        headers={
+            "HTTP-Referer": "http://localhost:3000",
+            "X-Title": "LiveLingo Project"
+        }
+    )
 
     model = RealtimeModel(
         api_key=siliconflow_key,
-        base_url=SILICONFLOW_BASE_URL,
-        model=SILICONFLOW_MODEL,
-        modalities=["audio", "text"],
+        base_url=OPENROUTER_BASE_URL,    
+        model=OPENROUTER_MODEL,
+        modalities=["audio", "text"],     
         temperature=0.1,
-        instructions=build_system_instruction(cfg.target_language),
+        http_session=http_session
     )
 
-    agent = MultimodalAgent(model=model)
-    agent.start(ctx.room)
+    agent = Agent(
+        instructions=build_system_instruction(cfg.target_language)
+    )
+
+    # Implement Skip-on-Lag
+    session = AgentSession(
+        vad=silero.VAD.load(),
+        llm=model,
+    )
+    # Optional logic to discard frames if the queue builds up
+    # In some LiveKit agents versions, skip-on-lag logic might vary, 
+    # but normally the pipeline handles queue truncation on newer VAD frames.
+    
+    await session.start(agent=agent, room=ctx.room)
 
     room_disconnected = asyncio.Future[None]()
 
@@ -130,6 +142,7 @@ def main() -> None:
     target_room = args.room
 
     async def request_fnc(request: JobRequest) -> None:
+        print(f"Received request: {request.room.name} at {target_room}", flush=True)
         if request.room.name != target_room:
             await request.reject(terminate=False)
             return

@@ -270,8 +270,8 @@ class LiveKitSiliconOrchestrator extends EventEmitter {
       throw new Error("Missing LiveKit credentials. Set LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET");
     }
 
-    if (!process.env.SILICONFLOW_API_KEY) {
-      throw new Error("Missing SILICONFLOW_API_KEY");
+    if (!process.env.OPENROUTER_API_KEY) {
+      throw new Error("Missing OPENROUTER_API_KEY");
     }
   }
 
@@ -293,7 +293,7 @@ class LiveKitSiliconOrchestrator extends EventEmitter {
       sessionId: this.sessionId,
       hlsUrl: this.hlsUrl,
       lanes: LANE_CONFIG,
-      provider: "LiveKit+SiliconFlow",
+      provider: "LiveKit+OpenRouter",
     });
   }
 
@@ -429,6 +429,7 @@ class LiveKitSiliconOrchestrator extends EventEmitter {
         LIVEKIT_URL: this.livekitUrl,
         LIVEKIT_API_KEY: this.livekitApiKey,
         LIVEKIT_API_SECRET: this.livekitApiSecret,
+        OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY,
         PYTHONUNBUFFERED: "1",
         WORKER_PORT: String(workerPort),
       },
