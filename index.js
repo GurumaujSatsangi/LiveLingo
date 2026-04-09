@@ -6,19 +6,15 @@ import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import { EventEmitter } from "events";
 import { WebSocketServer } from "ws";
-import { AccessToken } from "livekit-server-sdk";
-import {
-  Room,
-  RoomEvent,
-  TrackKind,
-  AudioSource,
-  AudioFrame,
-  LocalAudioTrack,
-  TrackSource,
-} from "@livekit/rtc-node";
+import axios from "axios";
+import ffmpegPath from "ffmpeg-static";
+import { SarvamAIClient } from "sarvamai";
+import pkg from "wavefile";
 import StreamingAudioIngester from "./StreamingAudioIngester.js";
 import VadSegmenter from "./VadSegmenter.js";
 import IVSTranslatorStreamer from "./ivsTranslatorStreamer.js";
+
+const { WaveFile } = pkg;
 
 dotenv.config();
 
@@ -119,31 +115,28 @@ function pushTranscriptEntry(entry) {
 }
 
 const LANE_CONFIG = [
-  { laneKey: "hindi", languageCode: "hi-IN", targetLanguage: "Hindi", roomName: "translation-hi" },
-  { laneKey: "bangla", languageCode: "bn-IN", targetLanguage: "Bengali", roomName: "translation-bn" },
-  { laneKey: "tamil", languageCode: "ta-IN", targetLanguage: "Tamil", roomName: "translation-ta" },
+  { laneKey: "hindi", languageCode: "hi-IN", targetLanguage: "Hindi" },
+  { laneKey: "bangla", languageCode: "bn-IN", targetLanguage: "Bengali" },
+  { laneKey: "tamil", languageCode: "ta-IN", targetLanguage: "Tamil" },
 ];
 
-class LiveKitSiliconOrchestrator extends EventEmitter {
+class SarvamIvsOrchestrator extends EventEmitter {
   constructor(options = {}) {
     super();
 
     this.hlsUrl = options.hlsUrl || process.env.AWS_IVS_PLAYBACK_URL || process.env.LIVESTREAM_HLS_URL || "";
-    this.livekitUrl = options.livekitUrl || process.env.LIVEKIT_URL || "";
-    this.livekitApiKey = options.livekitApiKey || process.env.LIVEKIT_API_KEY || "";
-    this.livekitApiSecret = options.livekitApiSecret || process.env.LIVEKIT_API_SECRET || "";
-    this.pythonBin = options.pythonBin || process.env.PYTHON_BIN || path.resolve(__dirname, ".venv", "Scripts", "python.exe");
-    this.workerScript = options.workerScript || path.resolve(__dirname, "agents", "translation_worker.py");
-    this.maxLiveKitQueueMs = Number(options.maxLiveKitQueueMs || process.env.LIVEKIT_MAX_QUEUE_MS || 500);
-    this.liveKitAudioQueueMs = Number(options.liveKitAudioQueueMs || process.env.LIVEKIT_AUDIO_QUEUE_SIZE_MS || 15000);
-    this.liveKitConnectRetries = Number(options.liveKitConnectRetries || process.env.LIVEKIT_CONNECT_RETRIES || 4);
-    this.liveKitConnectRetryDelayMs = Number(
-      options.liveKitConnectRetryDelayMs || process.env.LIVEKIT_CONNECT_RETRY_DELAY_MS || 1500
-    );
+    this.maxSegmentQueueMs = Number(options.maxSegmentQueueMs || process.env.LIVEKIT_MAX_QUEUE_MS || 500);
     this.useSourceVideoForTranslated =
       String(options.useSourceVideoForTranslated ?? process.env.IVS_TRANSLATED_USE_SOURCE_VIDEO ?? "false").toLowerCase() ===
       "true";
     this.ffmpegThreadQueueSize = Number(options.ffmpegThreadQueueSize || process.env.FFMPEG_THREAD_QUEUE_SIZE || 4096);
+    this.ttsOutputSampleRate = Number(options.ttsOutputSampleRate || process.env.SARVAM_TTS_OUTPUT_RATE || 24000);
+    this.sttModel = options.sttModel || process.env.SARVAM_STT_MODEL || "saaras:v3";
+    this.translateModel = options.translateModel || process.env.SARVAM_TRANSLATE_MODEL || "sarvam-translate:v1";
+    this.ttsModel = options.ttsModel || process.env.SARVAM_TTS_MODEL || "bulbul:v3";
+    this.sarvamApiKey = options.sarvamApiKey || process.env.SARVAM_API_KEY || "";
+    this.sarvamClient = this.sarvamApiKey ? new SarvamAIClient({ apiSubscriptionKey: this.sarvamApiKey }) : null;
+    this.defaultTtsSpeaker = options.defaultTtsSpeaker || process.env.SARVAM_TTS_SPEAKER || "kabir";
 
     this.ingester = new StreamingAudioIngester({
       hlsUrl: this.hlsUrl,
@@ -165,23 +158,23 @@ class LiveKitSiliconOrchestrator extends EventEmitter {
 
     this.started = false;
     this.stopping = false;
-    this.sessionId = `silicon_live_${Date.now()}`;
+    this.sessionId = `sarvam_live_${Date.now()}`;
     this.stats = {
       startedAt: 0,
       chunksSeen: 0,
       segmentsBroadcast: 0,
       segmentsDroppedByLag: 0,
+      segmentsTranscribed: 0,
+      segmentsFailed: 0,
+      sttMsTotal: 0,
+      translationMsTotal: 0,
+      ttsMsTotal: 0,
     };
 
-    this.workers = new Map();
-    this.laneRooms = new Map();
-    this.laneAudioSources = new Map();
-    this.laneLocalTracks = new Map();
     this.laneReady = new Map();
-    this.laneCaptureQueues = new Map();
+    this.laneProcessingQueues = new Map();
     this.laneStreamers = new Map();
-    this.laneSubscribedTrackSid = new Map();
-    this.captureFramePaceMs = Number(options.captureFramePaceMs || process.env.LIVEKIT_CAPTURE_PACE_MS || 2);
+    this.laneSequence = new Map();
 
     this.onIngesterAudioData = null;
     this.onIngesterFatalError = null;
@@ -221,44 +214,13 @@ class LiveKitSiliconOrchestrator extends EventEmitter {
     this.vadSegmenter.on("vad-event", this.onVadEvent);
   }
 
-  isRoomConnected(room) {
-    if (!room) return false;
-
-    const state = String(room.connectionState || room.state || "").toLowerCase();
-    if (state === "connected") return true;
-    if (state === "reconnecting" || state === "connecting" || state === "disconnected") return false;
-
-    // Fallback for SDK variants that don't expose a normalized state string.
-    return Boolean(room.localParticipant && !room.isDisconnected);
-  }
-
   isLaneReady(languageCode) {
-    const room = this.laneRooms.get(languageCode);
-    const source = this.laneAudioSources.get(languageCode);
-    return Boolean(this.laneReady.get(languageCode) && room && source && this.isRoomConnected(room));
+    const streamer = this.laneStreamers.get(languageCode);
+    return Boolean(this.laneReady.get(languageCode) && streamer?.getStatus()?.isRunning);
   }
 
   sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
-  }
-
-  async waitForTrackPublicationReady(publication, room, languageCode, timeoutMs = 2500) {
-    const startedAt = Date.now();
-
-    while (Date.now() - startedAt < timeoutMs) {
-      if (this.stopping) {
-        throw new Error(`Lane initialization interrupted during shutdown lane=${languageCode}`);
-      }
-
-      const published = Boolean(publication?.trackSid || publication?.sid);
-      if (published && this.isRoomConnected(room)) {
-        return;
-      }
-
-      await this.sleep(50);
-    }
-
-    throw new Error(`Track publication was not confirmed lane=${languageCode} within ${timeoutMs}ms`);
   }
 
   validateConfig() {
@@ -266,12 +228,12 @@ class LiveKitSiliconOrchestrator extends EventEmitter {
       throw new Error("Missing HLS input URL. Set AWS_IVS_PLAYBACK_URL or LIVESTREAM_HLS_URL");
     }
 
-    if (!this.livekitUrl || !this.livekitApiKey || !this.livekitApiSecret) {
-      throw new Error("Missing LiveKit credentials. Set LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET");
+    if (!this.sarvamApiKey) {
+      throw new Error("Missing SARVAM_API_KEY");
     }
 
-    if (!process.env.OPENROUTER_API_KEY) {
-      throw new Error("Missing OPENROUTER_API_KEY");
+    if (!ffmpegPath) {
+      throw new Error("ffmpeg-static binary not found");
     }
   }
 
@@ -293,226 +255,323 @@ class LiveKitSiliconOrchestrator extends EventEmitter {
       sessionId: this.sessionId,
       hlsUrl: this.hlsUrl,
       lanes: LANE_CONFIG,
-      provider: "LiveKit+OpenRouter",
+      provider: "Sarvam+AWSIVS",
     });
   }
 
   async startLaneInfra(lane) {
     this.laneReady.set(lane.languageCode, false);
 
-    const room = new Room();
-    const token = await this.buildLaneToken(lane.roomName, `orchestrator-${lane.laneKey}-${Date.now()}`);
-
-    this.laneRooms.set(lane.languageCode, room);
-
-    room.on(RoomEvent.TrackSubscribed, async (track, publication, participant) => {
-      if (participant && participant.identity.includes('agent') && track.kind === TrackKind.KIND_AUDIO) {
-        console.log(`🔊 Subscribing lane ${lane.languageCode} streamer to AI Agent track`);
-        const streamer = this.laneStreamers.get(lane.languageCode);
-        if (streamer) {
-          await streamer.subscribeToLiveKitTrack(track, { sampleRate: 24000 });
-        }
-      }
-    });
-
-    room.on(RoomEvent.Disconnected, () => {
-      this.emit("warning", `LiveKit room disconnected lane=${lane.languageCode}`);
-      this.laneReady.set(lane.languageCode, false);
-      this.laneSubscribedTrackSid.delete(lane.languageCode);
-    });
-
-    await this.connectRoomWithRetry(room, token, lane.languageCode);
-
-    const source = new AudioSource(16000, 1, this.liveKitAudioQueueMs);
-
-    const localTrack = LocalAudioTrack.createAudioTrack(`source-${lane.laneKey}`, source);
-    const publication = await room.localParticipant.publishTrack(localTrack, {
-      source: TrackSource.SOURCE_MICROPHONE,
-    });
-
-    await this.waitForTrackPublicationReady(publication, room, lane.languageCode);
-
-    this.laneAudioSources.set(lane.languageCode, source);
-    this.laneLocalTracks.set(lane.languageCode, localTrack);
-
     const streamer = new IVSTranslatorStreamer({
       language: lane.laneKey,
       sourceVideoUrl: this.useSourceVideoForTranslated ? this.hlsUrl : "",
-      inputSampleRate: 24000,
+      inputSampleRate: this.ttsOutputSampleRate,
       videoSyncDelaySec: Number(process.env.VIDEO_SYNC_DELAY_SEC || 0),
       maxMissingSequenceWaitMs: Number(process.env.IVS_MAX_MISSING_SEQUENCE_WAIT_MS || 120),
       ffmpegThreadQueueSize: this.ffmpegThreadQueueSize,
+      translatedAudioGain: Number(process.env.TRANSLATED_AUDIO_GAIN || 1.6),
     });
 
     try {
       await streamer.startStream(this.sessionId);
       this.laneStreamers.set(lane.languageCode, streamer);
+      this.laneSequence.set(lane.languageCode, 1);
     } catch (err) {
       this.laneReady.set(lane.languageCode, false);
-      try {
-        await room.disconnect();
-      } catch {
-        // Best effort cleanup.
-      }
       throw err;
     }
 
-    this.spawnWorker(lane);
     this.laneReady.set(lane.languageCode, true);
   }
 
-  async connectRoomWithRetry(room, token, languageCode) {
-    let lastError = null;
-
-    for (let attempt = 1; attempt <= this.liveKitConnectRetries; attempt += 1) {
-      try {
-        await room.connect(this.livekitUrl, token, {
-          autoSubscribe: true,
-          dynacast: false,
-        });
-        return;
-      } catch (err) {
-        lastError = err;
-        const isLast = attempt >= this.liveKitConnectRetries;
-        this.emit(
-          "warning",
-          `LiveKit connect failed lane=${languageCode} attempt=${attempt}/${this.liveKitConnectRetries}: ${err.message}`
-        );
-
-        if (isLast) {
-          break;
-        }
-
-        await new Promise((resolve) => setTimeout(resolve, this.liveKitConnectRetryDelayMs));
-      }
+  decodeSarvamAudioBase64(maybeBase64) {
+    if (!maybeBase64 || typeof maybeBase64 !== "string") {
+      return Buffer.alloc(0);
     }
 
-    throw new Error(
-      `LiveKit connect failed lane=${languageCode} after ${this.liveKitConnectRetries} attempts: ${lastError?.message || "unknown error"}`
+    const cleanBase64 = maybeBase64.includes(",")
+      ? maybeBase64.slice(maybeBase64.indexOf(",") + 1)
+      : maybeBase64;
+
+    return Buffer.from(cleanBase64, "base64");
+  }
+
+  detectAudioFormat(audioBuffer) {
+    if (!Buffer.isBuffer(audioBuffer) || audioBuffer.length < 4) {
+      return "unknown";
+    }
+
+    if (audioBuffer.slice(0, 4).toString("ascii") === "RIFF" && audioBuffer.slice(8, 12).toString("ascii") === "WAVE") {
+      return "wav";
+    }
+
+    if (audioBuffer.slice(0, 3).toString("ascii") === "ID3") {
+      return "mp3";
+    }
+
+    if (audioBuffer.slice(0, 4).toString("ascii") === "OggS") {
+      return "ogg";
+    }
+
+    if (audioBuffer.slice(0, 4).toString("ascii") === "fLaC") {
+      return "flac";
+    }
+
+    if (audioBuffer[0] === 0xff && (audioBuffer[1] & 0xe0) === 0xe0) {
+      return "mp3";
+    }
+
+    return "pcm16le";
+  }
+
+  pcm16ToWavBuffer(pcmBuffer, sampleRate = 16000) {
+    const alignedLength = pcmBuffer.length - (pcmBuffer.length % 2);
+    const pcmSlice = pcmBuffer.subarray(0, alignedLength);
+    const wav = new WaveFile();
+    wav.fromScratch(
+      1,
+      sampleRate,
+      "16",
+      new Int16Array(pcmSlice.buffer, pcmSlice.byteOffset, pcmSlice.length / 2)
     );
+    return Buffer.from(wav.toBuffer());
   }
 
-  async buildLaneToken(roomName, identity) {
-    const token = new AccessToken(this.livekitApiKey, this.livekitApiSecret, {
-      identity,
-      name: identity,
-      ttl: "2h",
-    });
+  async transcodeToPcm16Mono(buffer, { inputFormat = "wav", inputSampleRate = 24000, outputSampleRate = 24000 } = {}) {
+    const args = ["-loglevel", "error"];
+    if (inputFormat === "pcm16le") {
+      args.push("-f", "s16le", "-ar", String(inputSampleRate), "-ac", "1", "-i", "pipe:0");
+    } else {
+      args.push("-i", "pipe:0");
+    }
 
-    token.addGrant({
-      roomJoin: true,
-      room: roomName,
-      canPublish: true,
-      canSubscribe: true,
-      canPublishData: false,
-    });
+    args.push("-f", "s16le", "-ac", "1", "-ar", String(outputSampleRate), "pipe:1");
 
-    return token.toJwt();
+    return new Promise((resolve, reject) => {
+      const proc = spawn(ffmpegPath, args, {
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+
+      const outChunks = [];
+      let stderr = "";
+
+      proc.stdout.on("data", (data) => outChunks.push(data));
+      proc.stderr.on("data", (data) => {
+        stderr += data.toString();
+      });
+      proc.on("error", reject);
+      proc.on("close", (code) => {
+        if (code === 0) {
+          resolve(Buffer.concat(outChunks));
+          return;
+        }
+        reject(new Error(`FFmpeg transcode failed with code ${code}: ${stderr.trim()}`));
+      });
+
+      proc.stdin.end(buffer);
+    });
   }
 
-  spawnWorker(lane) {
-    const portMap = { "hi-IN": 8081, "bn-IN": 8082, "ta-IN": 8083 };
-    const workerPort = portMap[lane.languageCode] || 8081;
+  extractSarvamTextTranslation(response) {
+    if (!response) return "";
 
-    const args = [
-      this.workerScript,
-      "--target-language",
-      lane.targetLanguage,
-      "--room",
-      lane.roomName,
+    const candidateFields = [
+      response.translated_text,
+      response.translatedText,
+      response.translation,
+      response.output_text,
+      response.outputText,
+      response.text,
     ];
 
-    const child = spawn(this.pythonBin, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        LIVEKIT_URL: this.livekitUrl,
-        LIVEKIT_API_KEY: this.livekitApiKey,
-        LIVEKIT_API_SECRET: this.livekitApiSecret,
-        OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY,
-        PYTHONUNBUFFERED: "1",
-        WORKER_PORT: String(workerPort),
-      },
-    });
-
-    child.stdout.on("data", (data) => {
-      const msg = data.toString().trim();
-      if (msg) {
-        this.emit("warning", `[worker:${lane.languageCode}] ${msg}`);
+    for (const value of candidateFields) {
+      if (typeof value === "string" && value.trim()) {
+        return value.trim();
       }
-    });
-
-    child.stderr.on("data", (data) => {
-      const msg = data.toString().trim();
-      if (msg) {
-        this.emit("warning", `[worker:${lane.languageCode}] ${msg}`);
-      }
-    });
-
-    child.on("exit", (code, signal) => {
-      this.emit("warning", `Worker exited lane=${lane.languageCode} code=${code} signal=${signal || ""}`);
-      this.workers.delete(lane.languageCode);
-    });
-
-    this.workers.set(lane.languageCode, child);
-  }
-
-  async captureSegmentForLane(lane, segment) {
-    const room = this.laneRooms.get(lane.languageCode);
-    const source = this.laneAudioSources.get(lane.languageCode);
-
-    if (!this.isLaneReady(lane.languageCode) || !room || !source) {
-      return;
     }
 
-    const frameBytes = 640; // 20ms @ 16kHz mono s16le
-    let framesSincePause = 0;
+    if (typeof response === "string") {
+      return response.trim();
+    }
 
-    for (let offset = 0; offset < segment.buffer.length; offset += frameBytes) {
-      if (this.stopping || !this.isLaneReady(lane.languageCode)) {
-        return;
-      }
+    return "";
+  }
 
-      const chunk = segment.buffer.slice(offset, Math.min(offset + frameBytes, segment.buffer.length));
-      const frame =
-        chunk.length === frameBytes ? chunk : Buffer.concat([chunk, Buffer.alloc(frameBytes - chunk.length)]);
+  async transcribeSegmentToEnglish(segmentPcm16) {
+    const wavFileBuffer = this.pcm16ToWavBuffer(segmentPcm16, 16000);
+    const sttRes = await this.sarvamClient.speechToText.transcribe({
+      file: wavFileBuffer,
+      model: this.sttModel,
+      mode: "transcribe",
+    });
 
-      const samplesPerChannel = frame.length / 2;
-      const int16 = new Int16Array(samplesPerChannel);
-      for (let i = 0; i < samplesPerChannel; i += 1) {
-        int16[i] = frame.readInt16LE(i * 2);
-      }
+    return String(sttRes?.transcript || "").trim();
+  }
 
+  async translateEnglishToTarget(englishText, languageCode) {
+    const translated = await this.sarvamClient.text.translate({
+      input: englishText,
+      source_language_code: "en-IN",
+      target_language_code: languageCode,
+      model: this.translateModel,
+    });
+
+    return this.extractSarvamTextTranslation(translated) || englishText;
+  }
+
+  async synthesizeLaneTts(text, lane) {
+    const explicitLaneSpeaker = process.env[`SARVAM_TTS_SPEAKER_${lane.laneKey.toUpperCase()}`] || "";
+    const fallbackSpeakers = String(process.env.SARVAM_TTS_SPEAKER_FALLBACKS || "anushka")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    const speakerCandidates = Array.from(new Set([
+      explicitLaneSpeaker,
+      this.defaultTtsSpeaker,
+      ...fallbackSpeakers,
+    ].filter(Boolean)));
+
+    let lastError = null;
+    for (const speaker of speakerCandidates) {
       try {
-        await source.captureFrame(new AudioFrame(int16, 16000, 1, samplesPerChannel));
+        const ttsRes = await axios.post(
+          "https://api.sarvam.ai/text-to-speech",
+          {
+            inputs: [text],
+            target_language_code: lane.languageCode,
+            speaker,
+            pace: Number(process.env.SARVAM_TTS_PACE || 1),
+            speech_sample_rate: this.ttsOutputSampleRate,
+            enable_preprocessing: true,
+            model: this.ttsModel,
+          },
+          {
+            headers: {
+              "api-subscription-key": this.sarvamApiKey,
+            },
+          }
+        );
+
+        const encodedAudio = ttsRes?.data?.audios?.[0] || "";
+        const audioBuffer = this.decodeSarvamAudioBase64(encodedAudio);
+        const sampleRate = Number(ttsRes?.data?.sample_rate || ttsRes?.data?.sampleRate || this.ttsOutputSampleRate);
+        return { audioBuffer, sampleRate, speaker };
       } catch (err) {
-        // Transient disconnect windows can throw InvalidState; drop frame and continue.
-        if (err?.message?.includes("InvalidState")) {
-          continue;
-        }
-
-        this.emit("error", new Error(`Frame capture error lane=${lane.languageCode}: ${err.message}`));
-      }
-
-      framesSincePause += 1;
-      if (this.captureFramePaceMs > 0 && framesSincePause >= 5) {
-        framesSincePause = 0;
-        await this.sleep(this.captureFramePaceMs);
+        lastError = err;
       }
     }
+
+    throw lastError || new Error("Sarvam TTS request failed");
   }
 
-  enqueueSegmentForLane(lane, segment) {
+  formatHttpError(err) {
+    const status = err?.response?.status;
+    const statusText = err?.response?.statusText;
+    const responseData = err?.response?.data;
+    let details = "";
+
+    if (responseData) {
+      if (typeof responseData === "string") {
+        details = responseData;
+      } else {
+        try {
+          details = JSON.stringify(responseData);
+        } catch {
+          details = String(responseData);
+        }
+      }
+    }
+
+    const base = status ? `HTTP ${status}${statusText ? ` ${statusText}` : ""}` : String(err?.message || err);
+    return details ? `${base} | ${details}` : base;
+  }
+
+  enqueueSegmentForLane(lane, payload) {
     const key = lane.languageCode;
-    const previous = this.laneCaptureQueues.get(key) || Promise.resolve();
+    const previous = this.laneProcessingQueues.get(key) || Promise.resolve();
     const queued = previous
       .catch(() => {
         // Keep queue alive even if a previous async write failed.
       })
-      .then(() => this.captureSegmentForLane(lane, segment));
+      .then(() => this.processSegmentForLane(lane, payload));
 
-    this.laneCaptureQueues.set(key, queued);
+    this.laneProcessingQueues.set(key, queued);
     return queued;
+  }
+
+  async processSegmentForLane(lane, payload) {
+    if (!this.isLaneReady(lane.languageCode)) {
+      return { lane: lane.laneKey, ok: false, reason: "lane-not-ready" };
+    }
+
+    const streamer = this.laneStreamers.get(lane.languageCode);
+    if (!streamer) {
+      return { lane: lane.laneKey, ok: false, reason: "missing-streamer" };
+    }
+
+    let translatedText = "";
+    let translationMs = 0;
+    try {
+      const translateStart = Date.now();
+      translatedText = await this.translateEnglishToTarget(payload.englishText, lane.languageCode);
+      translationMs = Date.now() - translateStart;
+    } catch (err) {
+      this.stats.segmentsFailed += 1;
+      const reason = this.formatHttpError(err);
+      this.emit("warning", `Lane translation failed lane=${lane.languageCode}: ${reason}`);
+      return { lane: lane.laneKey, ok: false, reason };
+    }
+
+    let ttsResult = null;
+    let ttsMs = 0;
+    try {
+      const ttsStart = Date.now();
+      ttsResult = await this.synthesizeLaneTts(translatedText, lane);
+      ttsMs = Date.now() - ttsStart;
+    } catch (err) {
+      this.stats.segmentsFailed += 1;
+      const reason = this.formatHttpError(err);
+      this.emit("warning", `Lane TTS failed lane=${lane.languageCode}: ${reason}`);
+      return { lane: lane.laneKey, ok: false, reason };
+    }
+
+    try {
+      const detectedFormat = this.detectAudioFormat(ttsResult.audioBuffer);
+      const pcm24k = await this.transcodeToPcm16Mono(ttsResult.audioBuffer, {
+        inputFormat: detectedFormat,
+        inputSampleRate: ttsResult.sampleRate,
+        outputSampleRate: this.ttsOutputSampleRate,
+      });
+
+      if (!pcm24k.length) {
+        return { lane: lane.laneKey, ok: false, reason: "empty-tts" };
+      }
+
+      const nextSeq = this.laneSequence.get(lane.languageCode) || 1;
+      const queued = await streamer.sendTranslatedAudioChunk(pcm24k, { seq: nextSeq });
+      if (queued) {
+        this.laneSequence.set(lane.languageCode, nextSeq + 1);
+      }
+
+      this.stats.translationMsTotal += translationMs;
+      this.stats.ttsMsTotal += ttsMs;
+
+      return {
+        lane: lane.laneKey,
+        ok: Boolean(queued),
+        translatedText,
+        translationMs,
+        ttsMs,
+        bytes: pcm24k.length,
+        speaker: ttsResult.speaker,
+      };
+    } catch (err) {
+      this.stats.segmentsFailed += 1;
+      const reason = this.formatHttpError(err);
+      this.emit("warning", `Lane audio processing failed lane=${lane.languageCode}: ${reason}`);
+      return { lane: lane.laneKey, ok: false, reason };
+    }
   }
 
   async broadcastSegment(segment) {
@@ -521,9 +580,9 @@ class LiveKitSiliconOrchestrator extends EventEmitter {
     }
 
     const lagMs = Date.now() - segment.emittedAt;
-    if (lagMs > this.maxLiveKitQueueMs) {
+    if (lagMs > this.maxSegmentQueueMs) {
       this.stats.segmentsDroppedByLag += 1;
-      this.emit("warning", `Dropping segment ${segment.segmentId} lag=${lagMs}ms > ${this.maxLiveKitQueueMs}ms`);
+      this.emit("warning", `Dropping segment ${segment.segmentId} lag=${lagMs}ms > ${this.maxSegmentQueueMs}ms`);
       return;
     }
 
@@ -531,17 +590,49 @@ class LiveKitSiliconOrchestrator extends EventEmitter {
       return;
     }
 
+    let englishText = "";
+    const sttStart = Date.now();
+    try {
+      englishText = await this.transcribeSegmentToEnglish(segment.buffer);
+    } catch (err) {
+      this.stats.segmentsFailed += 1;
+      this.emit("error", new Error(`Sarvam STT failed for segment ${segment.segmentId}: ${err.message}`));
+      return;
+    }
+    const sttMs = Date.now() - sttStart;
+    this.stats.sttMsTotal += sttMs;
+
+    if (!englishText) {
+      return;
+    }
+
+    this.stats.segmentsTranscribed += 1;
+
     this.stats.segmentsBroadcast += 1;
 
-    await Promise.all(
-      LANE_CONFIG.map((lane) => this.enqueueSegmentForLane(lane, segment))
+    const laneResults = await Promise.all(
+      LANE_CONFIG.map((lane) => this.enqueueSegmentForLane(lane, { segment, englishText }))
     );
+
+    const translations = {};
+    for (const result of laneResults) {
+      if (result?.lane && result.translatedText) {
+        translations[result.lane] = { text: result.translatedText };
+      }
+    }
+
+    pushTranscriptEntry({
+      at: nowIso(),
+      sourceText: englishText,
+      translations,
+    });
 
     this.emit("segment-broadcast", {
       segmentId: segment.segmentId,
       durationMs: segment.durationMs,
       bytes: segment.buffer.length,
       reason: segment.reason,
+      sttMs,
     });
   }
 
@@ -566,15 +657,14 @@ class LiveKitSiliconOrchestrator extends EventEmitter {
       const streamer = this.laneStreamers.get(lane.languageCode);
       lanes[lane.languageCode] = {
         laneKey: lane.laneKey,
-        room: lane.roomName,
-        workerRunning: this.workers.has(lane.languageCode),
+        targetLanguage: lane.targetLanguage,
         streamer: streamer ? streamer.getStreamingStats() : null,
       };
     }
 
     return {
       sessionId: this.sessionId,
-      provider: "LiveKit+SiliconFlow",
+      provider: "Sarvam+AWSIVS",
       uptimeMs: this.stats.startedAt ? Date.now() - this.stats.startedAt : 0,
       ...this.stats,
       ingester: this.ingester.getStats(),
@@ -600,36 +690,17 @@ class LiveKitSiliconOrchestrator extends EventEmitter {
     // Optional flush for internal cleanup; no segment listener remains at this point.
     this.vadSegmenter.flush("shutdown_flush");
 
-    // Allow in-flight captureFrame calls to settle before disconnecting rooms.
-    await Promise.allSettled(Array.from(this.laneCaptureQueues.values()));
+    // Allow in-flight lane requests to settle before disconnecting streamers.
+    await Promise.allSettled(Array.from(this.laneProcessingQueues.values()));
     await this.sleep(200);
 
     for (const lane of LANE_CONFIG) {
       this.laneReady.set(lane.languageCode, false);
     }
 
-    for (const worker of this.workers.values()) {
-      try {
-        worker.kill("SIGTERM");
-      } catch {
-        // Best effort.
-      }
-    }
-    this.workers.clear();
-
-    for (const room of this.laneRooms.values()) {
-      try {
-        await room.disconnect();
-      } catch {
-        // Best effort.
-      }
-    }
-    this.laneRooms.clear();
-    this.laneAudioSources.clear();
-    this.laneLocalTracks.clear();
     this.laneReady.clear();
-    this.laneCaptureQueues.clear();
-    this.laneSubscribedTrackSid.clear();
+    this.laneProcessingQueues.clear();
+    this.laneSequence.clear();
 
     for (const streamer of this.laneStreamers.values()) {
       await streamer.stopStream();
@@ -644,7 +715,7 @@ class LiveKitSiliconOrchestrator extends EventEmitter {
 
 function attachOrchestratorListeners(instance) {
   instance.on("started", (event) => {
-    console.log(`${nowIso()} [startup] session=${event.sessionId} provider=LiveKit+SiliconFlow`);
+    console.log(`${nowIso()} [startup] session=${event.sessionId} provider=Sarvam+AWSIVS`);
   });
 
   instance.on("segment-broadcast", (event) => {
@@ -668,10 +739,11 @@ function attachOrchestratorListeners(instance) {
 
     const line = [
       `${nowIso()} [metrics]`,
-      `provider=LiveKit+SiliconFlow`,
+      `provider=Sarvam+AWSIVS`,
       `uptimeSec=${(stats.uptimeMs / 1000).toFixed(1)}`,
       `segments=${stats.segmentsBroadcast}`,
       `dropped=${stats.segmentsDroppedByLag}`,
+      `sttAvgMs=${stats.segmentsTranscribed > 0 ? (stats.sttMsTotal / stats.segmentsTranscribed).toFixed(1) : "0.0"}`,
       `hiQ=${hi?.queueLength ?? 0}`,
       `taQ=${ta?.queueLength ?? 0}`,
       `bnQ=${bn?.queueLength ?? 0}`,
@@ -683,7 +755,7 @@ function attachOrchestratorListeners(instance) {
 
 function createOrchestrator() {
   const orchestratorHlsUrl = buildPlaybackUrl(process.env.AWS_IVS_PLAYBACK_URL || process.env.LIVESTREAM_HLS_URL || "");
-  const instance = new LiveKitSiliconOrchestrator({
+  const instance = new SarvamIvsOrchestrator({
     hlsUrl: orchestratorHlsUrl,
   });
   attachOrchestratorListeners(instance);
@@ -768,7 +840,7 @@ app.get("/health", (req, res) => {
     status: "ok",
     port: PORT,
     orchestratorRunning,
-    provider: "LiveKit+SiliconFlow",
+    provider: "Sarvam+AWSIVS",
     transcripts: transcriptEntries.length,
     stats,
   });
@@ -779,10 +851,10 @@ app.post("/orchestrator/start", async (req, res) => {
     await startOrchestrator();
     pushTranscriptEntry({
       at: nowIso(),
-      sourceText: "LiveKit + SiliconFlow pipeline started",
-      translations: { hindi: { text: "LiveKit + SiliconFlow pipeline started" } },
+      sourceText: "Sarvam STT+Translate+TTS pipeline started",
+      translations: { hindi: { text: "Sarvam STT+Translate+TTS pipeline started" } },
     });
-    res.json({ started: true, provider: "LiveKit+SiliconFlow" });
+    res.json({ started: true, provider: "Sarvam+AWSIVS" });
   } catch (err) {
     res.status(500).json({ started: false, error: err.message });
   }
@@ -804,7 +876,7 @@ httpServer.listen(PORT, async () => {
   if (autoStart) {
     try {
       await startOrchestrator();
-      console.log(`${nowIso()} [startup] LiveKit+SiliconFlow orchestrator auto-started`);
+      console.log(`${nowIso()} [startup] Sarvam+AWSIVS orchestrator auto-started`);
     } catch (err) {
       console.error(`${nowIso()} [startup-error] ${err.message}`);
     }
